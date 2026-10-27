@@ -60,6 +60,14 @@
   .card { border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: var(--panel); }
   .card.start { border-color: var(--ok); background: var(--ok-weak); }
   .card.orphan { border-color: var(--warn); background: var(--warn-weak); }
+  .card .sub { display: flex; gap: 6px; align-items: center; margin-top: 6px; font-size: 12px; }
+  .card .sub select { padding: 3px 4px; font-size: 12px; }
+  .card.sub-del { outline: 2px solid var(--bad); outline-offset: -2px; }
+  .card.sub-del img { opacity: .45; }
+  .card.sub-front { outline: 2px solid var(--ok); outline-offset: -2px; }
+  .purpose { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .purpose button { border: 0; border-radius: 0; }
+  .purpose button.on { background: var(--accent); color: #fff; font-weight: bold; }
   .card img { width: 100%; display: block; border: 1px solid var(--line); background: #fff; min-height: 40px; }
   .card .meta { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin: 6px 0 4px; }
   .card input { width: 100%; font-family: Consolas, monospace; }
@@ -144,6 +152,15 @@
     <h2>4. 결과 확인 및 저장</h2>
     <p class="muted">신고서 첫 장(초록, UNI-PASS 로고 + 신고번호)에서 새 파일이 시작되고, 나머지 페이지는 앞 파일에 이어 붙습니다.
       같은 번호가 연속되면 한 파일로 합칩니다. 잘못 읽힌 번호는 직접 고치고, 나누는 위치는 '여기서 새 파일 시작'으로 바꿀 수 있어요.</p>
+    <div class="row" style="margin:12px 0 4px">
+      <b>저장 용도</b>
+      <div class="purpose" id="purpose">
+        <button data-purpose="keep">보관용</button>
+        <button data-purpose="sub">사후제출용</button>
+        <button data-purpose="both">둘 다</button>
+      </div>
+    </div>
+    <p class="muted" id="purposeDesc" style="margin:4px 0"></p>
     <div class="row" style="margin:10px 0">
       <button class="primary" id="zipBtn">📦 ZIP으로 다운로드</button>
       <button id="dirBtn">📂 폴더에 바로 저장</button>
@@ -164,7 +181,7 @@
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
 const $ = id => document.getElementById(id);
-const DEFAULTS = { prefix: '43632', suffix: 'M', dpi: '200', roiW: 60, roiH: 25, forceOcr: false, useLogo: true };
+const DEFAULTS = { prefix: '43632', suffix: 'M', dpi: '200', roiW: 60, roiH: 25, forceOcr: false, useLogo: true, purpose: 'both' };
 const settings = loadSettings();
 let files = [];      // { name, buf, pdf, pages: [{ no, src, thumb, logo, start }] }
 let worker = null;
@@ -472,6 +489,109 @@ function logoScore(roi, pageW) {
   return best;
 }
 
+// ───────── 서류 종류 (사후제출용) ─────────
+// 세관에 내지 않는 신고서류: 페이지 위쪽 제목에 이 말이 보이면 사후제출용에서 뺌
+const DEL_DOCS = [
+  ['견본(수입)', /견본/],
+  ['검사계획 및 결과보고서', /검사계획|결과보고서/],
+  ['검사 참여 신청(통보)서', /참여신청|검사참여/],
+  ['가격신고 상세 내용', /가격신고상세|상세내용/],
+  ['가격신고서', /가격신고서/],
+  ['협정관세적용신청서', /협정관세적용|관세적용신청/],
+  ['수입신고서', /수입신고서/],
+];
+const PURPOSE_NAME = { keep: '보관용', sub: '사후제출용' };
+let korWorker = null;
+
+async function getKorWorker() {
+  if (korWorker) return korWorker;
+  log('🔤 한글 OCR 준비 중... (처음 한 번은 인터넷에서 받아옵니다)');
+  korWorker = await Tesseract.createWorker(['kor', 'eng'], 1);
+  // 자동 배치 분석: 상자 안에 든 제목(COMMERCIAL INVOICE 등)도 따로 찾아 읽음
+  await korWorker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.AUTO });
+  return korWorker;
+}
+
+// 페이지 위쪽 25%(제목 부분)를 한글+영문으로 읽음. 인보이스 제목이 조금 아래에 있는 경우가 있어 25%
+async function readHeader(page) {
+  const vp = page.getViewport({ scale: 150 / 72 });
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(vp.width); c.height = Math.round(vp.height * 0.25);
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+  await page.render({ canvasContext: ctx, viewport: vp }).promise;
+  const { data } = await (await getKorWorker()).recognize(c, {}, { blocks: true });
+  const words = (data.blocks || []).flatMap(b => b.paragraphs.flatMap(p => p.lines.flatMap(l => l.words)));
+  // 영문 서류에서 한글이 잘못 섞여 나오는 것을 막으려고 확실히 읽힌 글자만 셈
+  const hangul = words.filter(w => w.confidence >= 70).reduce((n, w) => n + (w.text.match(/[가-힣]/g) || []).length, 0);
+  const lines = (data.blocks || []).flatMap(b => b.paragraphs.flatMap(p => p.lines)).map(l => l.text.toUpperCase().replace(/[^A-Z]/g, ''));
+  return { text: data.text.replace(/\s/g, ''), hangul, lines, thumb: makeThumb(c) };
+}
+
+// 페이지 전체에서 확실히 읽힌 한글 낱말(2글자 이상) 수. 실측: 포워더 청구서 6~10개, 영문 인보이스 0개
+async function bodyHangulWords(page) {
+  const vp = page.getViewport({ scale: 150 / 72 });
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(vp.width); c.height = Math.ceil(vp.height);
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+  await page.render({ canvasContext: ctx, viewport: vp }).promise;
+  const { data } = await (await getKorWorker()).recognize(c, {}, { blocks: true });
+  const words = (data.blocks || []).flatMap(b => b.paragraphs.flatMap(p => p.lines.flatMap(l => l.words)));
+  return words.filter(w => w.confidence >= 70 && /[가-힣]{2,}/.test(w.text)).length;
+}
+
+function classifyHeader(h, logo) {
+  // 견본(수입)·수입신고서 첫 장은 UNI-PASS 로고가 있음. 손글씨 번호가 제목을 가려 못 읽어도 뺌
+  // (서식 칸 이름의 '가격신고' 같은 말에 걸려 엉뚱한 제목이 붙지 않게 로고를 먼저 봄)
+  if (logo) return { act: 'del', title: /수입신고서/.test(h.text) && !/견본/.test(h.text) ? '수입신고서' : '견본(수입) / 수입신고서' };
+  for (const [title, re] of DEL_DOCS) if (re.test(h.text)) return { act: 'del', title };
+  // 제목처럼 한 줄 전체가 INVOICE 인 경우만 인정 (패킹리스트의 "No. & date of invoice" 같은 칸 이름 제외)
+  const titleLine = h.lines.find(l => /^.{0,4}(COMMERCIAL)?INVOICE.{0,4}$/.test(l));
+  if (titleLine) {
+    if (titleLine.includes('COMMERCIAL')) return { act: 'front', title: 'COMMERCIAL INVOICE' };
+    // 위쪽에 한글이 안 보여도 본문까지 확인해야 함 (classifyAll 에서 페이지 전체를 읽음)
+    return h.hangul >= 2 ? { act: 'keep', title: 'INVOICE (한글 포함)' } : { act: 'front', title: 'INVOICE', checkBody: true };
+  }
+  return { act: 'keep', title: '' };
+}
+
+// 아직 서류 종류를 안 읽은 페이지를 모두 읽음 (사후제출용을 고를 때만 필요)
+async function classifyAll() {
+  const todo = files.flatMap(f => f.pages.map((p, i) => [f, p, i])).filter(([, p]) => !p.sub);
+  if (!todo.length) return;
+  $('runBtn').disabled = true;
+  let n = 0;
+  for (const [f, p, i] of todo) {
+    $('status').textContent = `서류 종류 읽는 중 ${++n}/${todo.length}페이지 (사후제출용)`;
+    $('bar').style.width = (n / todo.length * 100) + '%';
+    try {
+      const page = await f.pdf.getPage(i + 1);
+      const h = await readHeader(page);
+      p.sub = { ...classifyHeader(h, p.logo), hangul: h.hangul };
+      p.headThumb = h.thumb;
+      // 그냥 'INVOICE' 인 페이지는 본문에 한글이 있으면(포워더 청구서 등) 앞으로 옮기지 않음
+      if (p.sub.checkBody && await bodyHangulWords(page) >= 3) p.sub = { ...p.sub, act: 'keep', title: 'INVOICE (한글 포함)' };
+    } catch (err) {
+      p.sub = { act: 'keep', title: '', hangul: 0 };
+      log(`  ⚠️ ${i + 1}페이지 서류 종류 읽기 오류: ${err.message}`);
+    }
+  }
+  // 제목 없이 이어지는 한글 서식(예: 가격신고서 둘째 장)은 바로 앞 신고서류와 함께 뺌
+  for (const f of files) {
+    f.pages.forEach((p, i) => {
+      const prev = f.pages[i - 1];
+      if (prev && !p.start && !p.sub.title && p.sub.hangul >= 10 && prev.sub.act === 'del') {
+        p.sub = { ...p.sub, act: 'del', title: `${prev.sub.title.replace(/ \(이어지는 장\)$/, '')} (이어지는 장)` };
+      }
+    });
+  }
+  $('status').textContent = '서류 종류 읽기 완료';
+  $('runBtn').disabled = false;
+}
+
+const purposes = () => settings.purpose === 'both' ? ['keep', 'sub'] : [settings.purpose];
+
 function makeThumb(canvas) {
   const t = document.createElement('canvas');
   const scale = Math.min(1, 420 / canvas.width);
@@ -553,11 +673,29 @@ async function run() {
     });
     if (stopFlag) { log('⏹ 중지됨'); break; }
   }
+  if (!stopFlag && settings.purpose !== 'keep') await classifyAll();
   const sec = ((performance.now() - t0) / 1000).toFixed(1);
   $('status').textContent = stopFlag ? '중지됨' : `완료 (${sec}초)`;
   $('runBtn').disabled = false; $('stopBtn').disabled = true;
   renderResults();
 }
+
+// ───────── 저장 용도 선택 ─────────
+function renderPurpose() {
+  $('purpose').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.purpose === settings.purpose));
+  $('purposeDesc').textContent = {
+    keep: '사무실 보관: 모든 서류를 스캔 순서 그대로, 파일명 끝에 " 보관용"',
+    sub: '세관 제출: 신고서류는 빼고 인보이스를 맨 앞으로, 파일명은 신고번호만',
+    both: '보관용과 사후제출용을 한 번에 저장해요 (ZIP 2개 / 하위 폴더 2개)',
+  }[settings.purpose];
+}
+$('purpose').querySelectorAll('button').forEach(b => b.addEventListener('click', async () => {
+  settings.purpose = b.dataset.purpose;
+  saveSettings();
+  renderPurpose();
+  if (settings.purpose !== 'keep' && files.some(f => f.pages.length)) await classifyAll();
+  renderResults();
+}));
 
 // ───────── 분할 구간 ─────────
 function buildSegments(f) {
@@ -628,21 +766,35 @@ function gapGuesses(no, used) {
 function renderResults() {
   if (!files.some(f => f.pages.length)) return;
   $('resultPanel').classList.remove('hidden');
+  const showSub = settings.purpose !== 'keep';
+  const subCtl = p => !showSub || !p.sub ? '' : `
+    <div class="sub">
+      <select class="subSel">
+        <option value="keep" ${p.sub.act === 'keep' ? 'selected' : ''}>제출에 포함</option>
+        <option value="front" ${p.sub.act === 'front' ? 'selected' : ''}>맨 앞으로</option>
+        <option value="del" ${p.sub.act === 'del' ? 'selected' : ''}>제출에서 빼기</option>
+      </select>
+      <span class="muted">${esc(p.sub.title)}</span>
+    </div>`;
   $('pageArea').innerHTML = files.filter(f => f.pages.length).map((f, fi) => `
     <div class="file-block">
       <h3>${esc(f.name)}</h3>
       <div class="grid">
         ${f.pages.map((p, i) => `
-          <div class="card" data-f="${files.indexOf(f)}" data-p="${i}">
-            <img src="${p.thumb}" alt="${i + 1}페이지 좌측 상단">
+          <div class="card ${showSub && p.sub ? `sub-${p.sub.act}` : ''}" data-f="${files.indexOf(f)}" data-p="${i}">
+            <img src="${showSub && p.headThumb ? p.headThumb : p.thumb}" alt="${i + 1}페이지 위쪽">
             <div class="meta"><span>${i + 1}페이지${p.logo ? ' · 🛡 로고' : ''}</span><span class="src">${p.src}</span></div>
             <input type="text" value="${esc(p.no)}" placeholder="번호 없음">
             <label class="row" style="font-size:12px;margin-top:4px"><input type="checkbox" class="startChk" ${p.start ? 'checked' : ''}> 여기서 새 파일 시작</label>
+            ${subCtl(p)}
             <div class="cont"></div>
           </div>`).join('')}
       </div>
     </div>`).join('');
   const pageOf = el => { const card = el.closest('.card'); return files[+card.dataset.f].pages[+card.dataset.p]; };
+  $('pageArea').querySelectorAll('.card .subSel').forEach(sel => {
+    sel.addEventListener('change', () => { pageOf(sel).sub.act = sel.value; renderResults(); });
+  });
   $('pageArea').querySelectorAll('.card input[type=text]').forEach(inp => {
     inp.addEventListener('change', () => {
       const p = pageOf(inp);
@@ -696,8 +848,8 @@ function renderSegTable() {
       <td><b>${i + 1}</b></td>
       <td class="mono">${esc(s.filename)}${s.no ? '' : ' <span style="color:var(--warn)">⚠ 번호 없음</span>'}</td>
       <td>${esc(s.file.name)}</td>
-      <td>${a === b ? a : `${a}~${b}`} (${s.pages.length}장)</td>
-      <td><button data-seg="${i}">받기</button></td></tr>${conflictRow}${dupRow}${warnRow}`;
+      <td>${a === b ? a : `${a}~${b}`} (${s.pages.length}장)${settings.purpose !== 'keep' ? `<br><span class="muted">제출 ${pagesFor(s, 'sub').length}장</span>` : ''}</td>
+      <td>${purposes().map(k => `<button data-seg="${i}" data-kind="${k}">${purposes().length > 1 ? PURPOSE_NAME[k] : '받기'}</button>`).join(' ')}</td></tr>${conflictRow}${dupRow}${warnRow}`;
   }).join('');
   $('segBody').querySelectorAll('button[data-fix]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -721,8 +873,8 @@ function renderSegTable() {
   });
   $('segBody').querySelectorAll('button[data-seg]').forEach(btn => {
     btn.addEventListener('click', async () => {
-      const s = segs[+btn.dataset.seg];
-      downloadBlob(new Blob([await buildPdf(s)], { type: 'application/pdf' }), s.filename);
+      const s = segs[+btn.dataset.seg], kind = btn.dataset.kind;
+      downloadBlob(new Blob([await buildPdf(s, kind)], { type: 'application/pdf' }), outName(s, kind));
     });
   });
   // 카드 색상: 새 파일 시작 / 앞에 이어짐 / 번호 없는 앞부분
@@ -743,46 +895,73 @@ function renderSegTable() {
 }
 
 // ───────── 저장 ─────────
+// 보관용: 모든 페이지 스캔 순서 그대로
+// 사후제출용: 뺄 페이지 제외, '맨 앞으로' 페이지(인보이스)를 앞에 두고 나머지는 원래 순서
+function pagesFor(seg, kind) {
+  if (kind === 'keep') return seg.pages;
+  const act = i => seg.file.pages[i].sub?.act || 'keep';
+  const kept = seg.pages.filter(i => act(i) !== 'del');
+  return [...kept.filter(i => act(i) === 'front'), ...kept.filter(i => act(i) !== 'front')];
+}
+
+// 보관용은 신고번호 뒤에 " 보관용", 사후제출용은 신고번호만
+const outName = (seg, kind) => kind === 'keep' ? seg.filename.replace(/\.pdf$/i, ' 보관용.pdf') : seg.filename;
+
 const srcDocs = new Map();
-async function buildPdf(seg) {
+async function buildPdf(seg, kind) {
   if (!srcDocs.has(seg.file)) srcDocs.set(seg.file, await PDFLib.PDFDocument.load(seg.file.buf, { ignoreEncryption: true }));
   const src = srcDocs.get(seg.file);
   const out = await PDFLib.PDFDocument.create();
-  const pages = await out.copyPages(src, seg.pages);
+  const pages = await out.copyPages(src, pagesFor(seg, kind));
   pages.forEach(p => out.addPage(p));
   return out.save();
 }
 
+// 사후제출용에서 남는 페이지가 없는 신고서는 건너뜀
+const segsFor = (segs, kind) => segs.filter(s => pagesFor(s, kind).length);
+
 $('zipBtn').addEventListener('click', async () => {
+  if (settings.purpose !== 'keep') await classifyAll();
   const segs = allSegments();
-  const zip = new JSZip();
-  for (let i = 0; i < segs.length; i++) {
-    $('saveStatus').textContent = `만드는 중 ${i + 1}/${segs.length}`;
-    zip.file(segs[i].filename, await buildPdf(segs[i]));
-  }
-  const blob = await zip.generateAsync({ type: 'blob' });
   const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-  downloadBlob(blob, `신고번호분할_${stamp}.zip`);
-  $('saveStatus').textContent = `✅ ${segs.length}개 파일 ZIP 저장`;
+  const done = [];
+  for (const kind of purposes()) {
+    const list = segsFor(segs, kind);
+    const zip = new JSZip();
+    for (let i = 0; i < list.length; i++) {
+      $('saveStatus').textContent = `${PURPOSE_NAME[kind]} 만드는 중 ${i + 1}/${list.length}`;
+      zip.file(outName(list[i], kind), await buildPdf(list[i], kind));
+    }
+    downloadBlob(await zip.generateAsync({ type: 'blob' }), `신고번호분할_${PURPOSE_NAME[kind]}_${stamp}.zip`);
+    done.push(`${PURPOSE_NAME[kind]} ${list.length}개`);
+    // 브라우저가 연달아 받는 파일을 막지 않도록 잠깐 쉼
+    await new Promise(r => setTimeout(r, 800));
+  }
+  $('saveStatus').textContent = `✅ ZIP 저장: ${done.join(', ')}`;
 });
 
 if (!window.showDirectoryPicker) $('dirBtn').classList.add('hidden');
 $('dirBtn').addEventListener('click', async () => {
   let dir;
   try { dir = await window.showDirectoryPicker({ mode: 'readwrite' }); } catch { return; }
+  if (settings.purpose !== 'keep') await classifyAll();
   const segs = allSegments();
-  let saved = 0;
-  for (const s of segs) {
-    $('saveStatus').textContent = `저장 중 ${saved + 1}/${segs.length}`;
-    const name = await uniqueName(dir, s.filename);
-    const fh = await dir.getFileHandle(name, { create: true });
-    const w = await fh.createWritable();
-    await w.write(await buildPdf(s));
-    await w.close();
-    saved++;
+  const done = [];
+  for (const kind of purposes()) {
+    // 고른 폴더 안에 '보관용', '사후제출용' 하위 폴더를 만들어 나눠 저장
+    const sub = await dir.getDirectoryHandle(PURPOSE_NAME[kind], { create: true });
+    const list = segsFor(segs, kind);
+    for (let i = 0; i < list.length; i++) {
+      $('saveStatus').textContent = `${PURPOSE_NAME[kind]} 저장 중 ${i + 1}/${list.length}`;
+      const fh = await sub.getFileHandle(await uniqueName(sub, outName(list[i], kind)), { create: true });
+      const w = await fh.createWritable();
+      await w.write(await buildPdf(list[i], kind));
+      await w.close();
+    }
+    done.push(`${PURPOSE_NAME[kind]} ${list.length}개`);
   }
-  $('saveStatus').textContent = `✅ ${saved}개 파일을 "${dir.name}" 폴더에 저장`;
-  log(`📂 ${dir.name} 폴더에 ${saved}개 저장`);
+  $('saveStatus').textContent = `✅ "${dir.name}" 폴더에 저장: ${done.join(', ')}`;
+  log(`📂 ${dir.name} 폴더에 저장: ${done.join(', ')}`);
 });
 
 // 폴더에 같은 이름이 있으면 _1, _2 를 붙임
@@ -806,6 +985,7 @@ function log(msg) { const el = $('log'); el.textContent += msg + '\n'; el.scroll
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
 bindSettings();
+renderPurpose();
 </script>
 </body>
 </html>
