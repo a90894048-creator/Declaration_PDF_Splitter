@@ -280,7 +280,12 @@ function findShingo(raw) {
   const re = prefixes.length
     ? new RegExp(`(${prefixes.join('|')})-?(\\d{2})-?(\\d{6})`, 'g')
     : /(\d{5})-(\d{2})-(\d{6})/g;
-  const m = re.exec(fixed);
+  // 번호가 여러 개 보이면 하이픈이 들어간 것을 우선 (좌측 '신고번호' 칸은 43632-26-303166M 형식,
+  // 가운데 'File No2 : 4363226300089M' 같은 참고 번호는 하이픈이 없음)
+  let m = null;
+  for (let x; (x = re.exec(fixed));) {
+    if (!m || (x[0].match(/-/g) || []).length > (m[0].match(/-/g) || []).length) m = x;
+  }
   if (!m) return null;
   // 끝 문자는 OCR이 M을 H·MM 등으로 잘못 읽는 일이 많아 설정값이 있으면 그 글자로 고정
   const tail = s.slice(m.index + m[0].length).match(/^[A-Z]/);
@@ -373,8 +378,10 @@ const looksLikeNumber = text => {
 function findNumberLine(datas) {
   const lines = datas.flatMap(d => (d.blocks || []).flatMap(b => b.paragraphs.flatMap(p => p.lines)));
   const prefixes = prefixList();
+  // 하이픈 형식(26-303166)이 보이는 줄이 진짜 신고번호 칸. 하이픈 없는 File No2 줄보다 우선
+  const hyphened = lines.find(l => /\d{2}-\d{6}/.test(digitize(l.text)));
   const byPrefix = prefixes.length && lines.find(l => prefixes.some(p => digitize(l.text).includes(p.slice(0, 4))));
-  return (byPrefix || lines.find(l => looksLikeNumber(l.text)))?.bbox || null;
+  return (hyphened || byPrefix || lines.find(l => looksLikeNumber(l.text)))?.bbox || null;
 }
 
 // 번호 줄만 300DPI로 잘라 3배 확대한 뒤 4가지 방식으로 읽고 다수결.
@@ -829,7 +836,9 @@ function renderSegTable() {
   const suspects = segs.filter((s, i) => isSuspectPair(s, segs[i + 1]) || s.conflicts.length || s.dup).length;
   $('segCount').innerHTML = `총 ${segs.length}개 PDF 파일`
     + (noNum ? ` <span style="color:var(--warn)">· 번호 없음 ${noNum}개</span>` : '')
-    + (suspects ? ` <span style="color:var(--warn)">· 확인 필요 ${suspects}건</span>` : '');
+    + (suspects ? ` <span style="color:var(--warn)">· 확인 필요 ${suspects}건</span>` : '')
+    + (settings.purpose !== 'keep' && segs.some(inspectedDoc)
+      ? ` <span class="muted">· 검사한 신고서 ${segs.filter(inspectedDoc).length}건은 사후제출용에서 제외</span>` : '');
   $('segBody').innerHTML = segs.map((s, i) => {
     const a = s.pages[0] + 1, b = s.pages[s.pages.length - 1] + 1;
     const suspect = isSuspectPair(s, segs[i + 1]);
@@ -848,8 +857,10 @@ function renderSegTable() {
       <td><b>${i + 1}</b></td>
       <td class="mono">${esc(s.filename)}${s.no ? '' : ' <span style="color:var(--warn)">⚠ 번호 없음</span>'}</td>
       <td>${esc(s.file.name)}</td>
-      <td>${a === b ? a : `${a}~${b}`} (${s.pages.length}장)${settings.purpose !== 'keep' ? `<br><span class="muted">제출 ${pagesFor(s, 'sub').length}장</span>` : ''}</td>
-      <td>${purposes().map(k => `<button data-seg="${i}" data-kind="${k}">${purposes().length > 1 ? PURPOSE_NAME[k] : '받기'}</button>`).join(' ')}</td></tr>${conflictRow}${dupRow}${warnRow}`;
+      <td>${a === b ? a : `${a}~${b}`} (${s.pages.length}장)${settings.purpose === 'keep' ? ''
+        : inspectedDoc(s) ? `<br><span style="color:var(--warn)">사후제출 제외 (검사: ${esc(inspectedDoc(s))})</span>`
+        : `<br><span class="muted">제출 ${pagesFor(s, 'sub').length}장</span>`}</td>
+      <td>${purposes().filter(k => pagesFor(s, k).length).map(k => `<button data-seg="${i}" data-kind="${k}">${purposes().length > 1 ? PURPOSE_NAME[k] : '받기'}</button>`).join(' ')}</td></tr>${conflictRow}${dupRow}${warnRow}`;
   }).join('');
   $('segBody').querySelectorAll('button[data-fix]').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -897,8 +908,22 @@ function renderSegTable() {
 // ───────── 저장 ─────────
 // 보관용: 모든 페이지 스캔 순서 그대로
 // 사후제출용: 뺄 페이지 제외, '맨 앞으로' 페이지(인보이스)를 앞에 두고 나머지는 원래 순서
+// 검사한 신고서에만 붙는 서류. 이 중 하나라도 있으면 사후제출이 필요 없어서 사후제출용에서 통째로 뺌
+// (견본(수입)은 모든 신고서에 있으므로 제외)
+const INSPECT_DOCS = new Set(['검사계획 및 결과보고서', '검사 참여 신청(통보)서', '수입신고서', '가격신고서', '가격신고 상세 내용', '협정관세적용신청서']);
+function inspectedDoc(seg) {
+  for (const i of seg.pages) {
+    const sub = seg.file.pages[i].sub;
+    const title = sub?.title.replace(/ \(이어지는 장\)$/, '');
+    // 페이지를 직접 '제출에 포함'으로 바꾼 경우는 세지 않음
+    if (sub && sub.act === 'del' && INSPECT_DOCS.has(title)) return title;
+  }
+  return null;
+}
+
 function pagesFor(seg, kind) {
   if (kind === 'keep') return seg.pages;
+  if (inspectedDoc(seg)) return [];
   const act = i => seg.file.pages[i].sub?.act || 'keep';
   const kept = seg.pages.filter(i => act(i) !== 'del');
   return [...kept.filter(i => act(i) === 'front'), ...kept.filter(i => act(i) !== 'front')];
