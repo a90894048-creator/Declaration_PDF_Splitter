@@ -110,6 +110,10 @@
           <input type="range" id="roiH" min="5" max="60" step="1">
         </div>
         <div class="row">
+          <label class="row"><input type="checkbox" id="useLogo"> UNI-PASS 로고가 있는 페이지만 신고서 첫 장으로 보기</label>
+        </div>
+        <div class="muted" style="margin:2px 0 8px 24px">로고를 하나도 못 찾은 파일은 예전처럼 신고번호만 보고 나눕니다.</div>
+        <div class="row">
           <label class="row"><input type="checkbox" id="forceOcr"> 텍스트가 있는 PDF도 OCR 하기</label>
         </div>
       </div>
@@ -138,8 +142,8 @@
 
   <section class="panel hidden" id="resultPanel">
     <h2>4. 결과 확인 및 저장</h2>
-    <p class="muted">신고번호가 읽힌 페이지(초록)에서 새 파일이 시작되고, 번호가 없는 페이지는 앞 파일에 이어 붙습니다.
-      같은 번호가 연속되면 한 파일로 합칩니다. 잘못 읽힌 번호는 직접 고치고, 번호를 지우면 앞 파일에 이어집니다.</p>
+    <p class="muted">신고서 첫 장(초록, UNI-PASS 로고 + 신고번호)에서 새 파일이 시작되고, 나머지 페이지는 앞 파일에 이어 붙습니다.
+      같은 번호가 연속되면 한 파일로 합칩니다. 잘못 읽힌 번호는 직접 고치고, 나누는 위치는 '여기서 새 파일 시작'으로 바꿀 수 있어요.</p>
     <div class="row" style="margin:10px 0">
       <button class="primary" id="zipBtn">📦 ZIP으로 다운로드</button>
       <button id="dirBtn">📂 폴더에 바로 저장</button>
@@ -160,9 +164,9 @@
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
 const $ = id => document.getElementById(id);
-const DEFAULTS = { prefix: '43632', suffix: 'M', dpi: '200', roiW: 60, roiH: 25, forceOcr: false };
+const DEFAULTS = { prefix: '43632', suffix: 'M', dpi: '200', roiW: 60, roiH: 25, forceOcr: false, useLogo: true };
 const settings = loadSettings();
-let files = [];      // { name, buf, pdf, pages: [{ no, src, thumb }] }
+let files = [];      // { name, buf, pdf, pages: [{ no, src, thumb, logo, start }] }
 let worker = null;
 let stopFlag = false;
 
@@ -181,6 +185,7 @@ function bindSettings() {
   $('roiW').value = settings.roiW;
   $('roiH').value = settings.roiH;
   $('forceOcr').checked = settings.forceOcr;
+  $('useLogo').checked = settings.useLogo;
   const sync = () => {
     settings.prefix = $('prefix').value.replace(/[^\d,\s]/g, '');
     settings.suffix = $('suffix').value.toUpperCase().replace(/[^A-Z]/g, '');
@@ -188,12 +193,13 @@ function bindSettings() {
     settings.roiW = +$('roiW').value;
     settings.roiH = +$('roiH').value;
     settings.forceOcr = $('forceOcr').checked;
+    settings.useLogo = $('useLogo').checked;
     $('wVal').textContent = settings.roiW;
     $('hVal').textContent = settings.roiH;
     updateRoiBox();
     saveSettings();
   };
-  ['prefix', 'suffix', 'dpi', 'roiW', 'roiH', 'forceOcr'].forEach(id => $(id).addEventListener('input', sync));
+  ['prefix', 'suffix', 'dpi', 'roiW', 'roiH', 'forceOcr', 'useLogo'].forEach(id => $(id).addEventListener('input', sync));
   sync();
 }
 
@@ -353,6 +359,70 @@ async function ocrPage(page) {
   return { no: found, thumb: makeThumb(roi) };
 }
 
+// ───────── UNI-PASS 로고 찾기 ─────────
+// 신고서 첫 장 좌측 상단의 UNI-PASS 로고(페이지 폭 500px 기준으로 잘라낸 견본)와
+// 얼마나 닮았는지(정규화 상관계수)를 보고 첫 장인지 판단. 실측: 첫 장 0.86~0.97, 다른 페이지 0.70 이하
+const LOGO_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFoAAAAiCAYAAADf2c6uAAAORklEQVR4AezZZYxd1RYH8LUu7sUdWtwZ3N0dikOAFj7hEBIkaAkETXASLAQNFiS4U9wp7tDiTnG/8+5v3572znRKe9s+8h7pJGv2OVuW/Jfsffat1ev1znp9ZPrrr786e6I///yzc0zojz/+6Kzo999/72ylqr9728q3J9lVX70+sr71+t/3VWu19fqIud7HhOr1EWvq9fafa52dndETNYCJer0e/ow3QImGQpGZhfQ3gOmyVl9Fmc15mc1Wv/lafPEiw3tmFt6ezSHL2M8//xzeM5s86JGZphXKzC7yjY+KyoJh/1rnDOvqscnMYmtm9jjeTmdtVJMnmWSSAjSlgPLdd98FAgAgADDRRBONavlI/fiY/+uvvxa+QPT8/fffxy+//BK//fZb/PjjjzF06NBCnsnSb5wO1nz55ZdBPgFV6/l/nUYJNGAA8eGHH8bAgQPjwgsvjEsvvTSef/75YDDQxtTQWq1WItb81157LQYNGhTPPPNMvPTSS/Hqq6/Gxx9/HO+880688MIL8dBDD8Xtt99exh999NF48cUXy9hXX30Vd955Zxx//PHx1FNPlUjOHPdI+6ccVGO86GTEtddeG7feemvcddddccMNN8R5550XZ5xxRlx55ZXx3HPPxSOPPBIXX3xxnH766WX8nnvuiTfeeGM4AUUUKg3dDcjMMPb666/HW2+9VcD76KOPitM4Atgi11pRPHTo0BLhItnzZ599FrJs+umnj4knnrgATYb5FXnPzJHSPTMNFWeXh2H/BFNmcwwP7xWZUj13b421SzbDePjhh+Oqq66K+++/P2666aa47LLL4vrrr4/HHnssPvjgg/j6669DdANgyJAhIdKuvvrqEuHHHHNMVMRRIpbzWhUBsIhUJpZYYolYffXVY911141ll102Fl544Zh00klj9tlnjxVXXDE23njj2HnnnaN3796x6qqrxtJLLx2LL754zDrrrLHCCivEDjvsUN45hxOAXhFAAFaRceS9VR/P+gWYNd67k/5W6j7e7nsNuADCVNR88803ARDATjPNNDH//POX6Ono6CigzDjjjLHKKqvEDDPMUOaZW9GgQYOKw5QFhlTKKAVbbrllyRCliDOUCe2zzz4bjz/+eLz88sslS84555y44IILipNl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';
+const LOGO_PAGE_W = 500, LOGO_THRESHOLD = 0.78;
+let logoTpls = null;
+
+function toGray(canvas) {
+  const d = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+  const g = new Float32Array(canvas.width * canvas.height);
+  for (let i = 0; i < g.length; i++) g[i] = d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114;
+  return g;
+}
+
+async function loadLogo() {
+  if (logoTpls) return;
+  const img = new Image();
+  img.src = LOGO_PNG;
+  await img.decode();
+  // 스캔마다 크기가 조금씩 달라서 여러 배율로 준비
+  logoTpls = [0.85, 0.92, 1, 1.08, 1.16].map(s => {
+    const c = document.createElement('canvas');
+    c.width = Math.round(img.width * s); c.height = Math.round(img.height * s);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    const g = toGray(c);
+    const mean = g.reduce((a, v) => a + v, 0) / g.length;
+    const z = g.map(v => v - mean);
+    return { w: c.width, h: c.height, z, norm: Math.sqrt(z.reduce((a, v) => a + v * v, 0)) };
+  });
+}
+
+// roi: 좌측 상단을 그린 캔버스, pageW: 그때의 페이지 전체 폭(px)
+function logoScore(roi, pageW) {
+  const s = LOGO_PAGE_W / pageW;
+  const c = document.createElement('canvas');
+  c.width = Math.min(Math.round(roi.width * s), LOGO_PAGE_W * 0.5);
+  c.height = Math.min(Math.round(roi.height * s), Math.round(LOGO_PAGE_W * 1.414 * 0.2));
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+  ctx.drawImage(roi, 0, 0, roi.width * s, roi.height * s);
+  const g = toGray(c), W = c.width, H = c.height;
+  let best = -1;
+  for (const t of logoTpls) {
+    const n = t.w * t.h;
+    for (let y = 0; y + t.h <= H; y += 2) {
+      for (let x = 0; x + t.w <= W; x += 2) {
+        let sum = 0, sum2 = 0, cross = 0;
+        for (let j = 0; j < t.h; j++) {
+          const row = (y + j) * W + x, tr = j * t.w;
+          for (let i = 0; i < t.w; i++) {
+            const v = g[row + i];
+            sum += v; sum2 += v * v; cross += v * t.z[tr + i];
+          }
+        }
+        const variance = sum2 - sum * sum / n;
+        if (variance < 1) continue;
+        const ncc = cross / (Math.sqrt(variance) * t.norm);
+        if (ncc > best) best = ncc;
+      }
+    }
+  }
+  return best;
+}
+
 function makeThumb(canvas) {
   const t = document.createElement('canvas');
   const scale = Math.min(1, 420 / canvas.width);
@@ -373,34 +443,65 @@ document.addEventListener('visibilitychange', () => {
 async function run() {
   stopFlag = false;
   $('runBtn').disabled = true; $('stopBtn').disabled = false;
-  const total = files.reduce((a, f) => a + f.pdf.numPages, 0);
+  // 진행률: 페이지당 1단계 1칸 + 2단계(OCR) 1칸, OCR 안 할 페이지가 정해지면 전체에서 뺌
+  let total = files.reduce((a, f) => a + f.pdf.numPages * 2, 0);
   let done = 0;
+  const tick = () => { done++; $('bar').style.width = Math.min(100, done / total * 100) + '%'; };
   const t0 = performance.now();
+  if (settings.useLogo) await loadLogo();
   for (const f of files) {
     log(`\n📄 ${f.name}`);
     f.pages = [];
-    for (let i = 1; i <= f.pdf.numPages; i++) {
-      if (stopFlag) break;
-      $('status').textContent = `${f.name} · ${i}/${f.pdf.numPages}페이지`;
-      const page = await f.pdf.getPage(i);
-      let no = null, src = '', thumb = '';
+    const n = f.pdf.numPages;
+
+    // 1단계: 로고 찾기 + 텍스트 레이어 읽기 (빠름)
+    for (let i = 1; i <= n && !stopFlag; i++) {
+      $('status').textContent = `${f.name} · 로고 찾는 중 ${i}/${n}페이지`;
+      const p = { no: '', src: '', thumb: '', logo: false, start: false, needOcr: true };
       try {
+        const page = await f.pdf.getPage(i);
+        const pageW = 700;
+        const small = await renderRoi(page, pageW * 72 / page.getViewport({ scale: 1 }).width);
+        p.thumb = makeThumb(small);
+        if (settings.useLogo) p.logo = logoScore(small, pageW) >= LOGO_THRESHOLD;
         const t = await readTextLayer(page);
         if (t.hasText && !settings.forceOcr) {
-          no = findShingo(t.roiText); src = '텍스트';
-          thumb = makeThumb(await renderRoi(page, 72));
-        } else {
-          const r = await ocrPage(page);
-          no = r.no; thumb = r.thumb; src = 'OCR';
+          p.needOcr = false;
+          p.no = findShingo(t.roiText) || '';
+          if (p.no) p.src = '텍스트';
         }
       } catch (err) {
         log(`  ⚠️ ${i}페이지 오류: ${err.message}`);
       }
-      f.pages.push({ no: no || '', src: no ? src : '', thumb });
-      if (no) log(`  ${i}페이지: ${no} (${src})`);
-      done++;
-      $('bar').style.width = (done / total * 100) + '%';
+      f.pages.push(p);
+      tick();
     }
+    if (stopFlag) { log('⏹ 중지됨'); break; }
+
+    // 2단계: 번호 OCR. 로고가 있으면 로고 페이지와 바로 다음 페이지(번호 확인용)만 읽음
+    const logoMode = settings.useLogo && f.pages.some(p => p.logo);
+    if (settings.useLogo) {
+      log(logoMode ? `  🛡 UNI-PASS 로고: ${f.pages.filter(p => p.logo).length}개 페이지`
+        : '  로고를 못 찾아서 신고번호만 보고 나눕니다');
+    }
+    const targets = f.pages.map((p, i) => i)
+      .filter(i => f.pages[i].needOcr && (!logoMode || f.pages[i].logo || (i > 0 && f.pages[i - 1].logo)));
+    total -= n - targets.length;
+    for (const i of targets) {
+      if (stopFlag) break;
+      $('status').textContent = `${f.name} · 번호 읽는 중 ${i + 1}/${n}페이지`;
+      try {
+        const r = await ocrPage(await f.pdf.getPage(i + 1));
+        if (r.no) { f.pages[i].no = r.no; f.pages[i].src = 'OCR'; }
+      } catch (err) {
+        log(`  ⚠️ ${i + 1}페이지 오류: ${err.message}`);
+      }
+      tick();
+    }
+    f.pages.forEach((p, i) => {
+      p.start = logoMode ? p.logo : !!p.no;
+      if (p.no || p.logo) log(`  ${i + 1}페이지: ${p.no || '번호 못 읽음'}${p.logo ? ' 🛡' : ''}${p.src ? ` (${p.src})` : ''}`);
+    });
     if (stopFlag) { log('⏹ 중지됨'); break; }
   }
   const sec = ((performance.now() - t0) / 1000).toFixed(1);
@@ -415,10 +516,19 @@ function buildSegments(f) {
   let cur = null;
   f.pages.forEach((p, i) => {
     const no = p.no.trim();
-    if (no && (!cur || cur.no !== no)) { cur = { file: f, no, pages: [i] }; segs.push(cur); }
-    else if (cur) cur.pages.push(i);
-    else { cur = { file: f, no: '', pages: [i] }; segs.push(cur); }
+    // 시작 페이지라도 바로 앞 파일과 번호가 같으면 이어 붙임 (예: 신고서 + 필증)
+    if (p.start && !(cur && no && cur.no === no)) { cur = { file: f, no, pages: [i] }; segs.push(cur); }
+    else if (cur) {
+      cur.pages.push(i);
+      // 첫 장 번호를 못 읽었으면 뒤 페이지의 번호를 씀
+      if (!cur.no && no && !cur.orphan) cur.no = no;
+    }
+    else { cur = { file: f, no: '', pages: [i], orphan: true }; segs.push(cur); }
   });
+  // 같은 신고서 안에서 번호가 다르게 읽힌 경우 (예: 첫 장 …530M, 둘째 장 …539M)
+  for (const s of segs) {
+    s.conflicts = s.orphan ? [] : [...new Set(s.pages.map(i => f.pages[i].no.trim()).filter(no => no && no !== s.no))];
+  }
   return segs;
 }
 
@@ -450,21 +560,28 @@ function renderResults() {
         ${f.pages.map((p, i) => `
           <div class="card" data-f="${files.indexOf(f)}" data-p="${i}">
             <img src="${p.thumb}" alt="${i + 1}페이지 좌측 상단">
-            <div class="meta"><span>${i + 1}페이지</span><span class="src">${p.src}</span></div>
-            <input type="text" value="${esc(p.no)}" placeholder="번호 없음 (앞에 이어짐)">
+            <div class="meta"><span>${i + 1}페이지${p.logo ? ' · 🛡 로고' : ''}</span><span class="src">${p.src}</span></div>
+            <input type="text" value="${esc(p.no)}" placeholder="번호 없음">
+            <label class="row" style="font-size:12px;margin-top:4px"><input type="checkbox" class="startChk" ${p.start ? 'checked' : ''}> 여기서 새 파일 시작</label>
             <div class="cont"></div>
           </div>`).join('')}
       </div>
     </div>`).join('');
-  $('pageArea').querySelectorAll('.card input').forEach(inp => {
+  const pageOf = el => { const card = el.closest('.card'); return files[+card.dataset.f].pages[+card.dataset.p]; };
+  $('pageArea').querySelectorAll('.card input[type=text]').forEach(inp => {
     inp.addEventListener('change', () => {
-      const card = inp.closest('.card');
-      const p = files[+card.dataset.f].pages[+card.dataset.p];
+      const p = pageOf(inp);
+      const before = p.no;
       p.no = inp.value.trim().toUpperCase();
       p.src = p.no ? '수동' : '';
-      card.querySelector('.src').textContent = p.src;
-      renderSegTable();
+      // 빈 칸에 번호를 넣으면 새 파일 시작, 번호를 지우면 앞 파일에 이어 붙임
+      if (!before && p.no) p.start = true;
+      if (!p.no) p.start = false;
+      renderResults();
     });
+  });
+  $('pageArea').querySelectorAll('.card .startChk').forEach(chk => {
+    chk.addEventListener('change', () => { pageOf(chk).start = chk.checked; renderResults(); });
   });
 }
 
@@ -480,7 +597,7 @@ function isSuspectPair(a, b) {
 function renderSegTable() {
   const segs = allSegments();
   const noNum = segs.filter(s => !s.no).length;
-  const suspects = segs.filter((s, i) => isSuspectPair(s, segs[i + 1])).length;
+  const suspects = segs.filter((s, i) => isSuspectPair(s, segs[i + 1]) || s.conflicts.length).length;
   $('segCount').innerHTML = `총 ${segs.length}개 PDF 파일`
     + (noNum ? ` <span style="color:var(--warn)">· 번호 없음 ${noNum}개</span>` : '')
     + (suspects ? ` <span style="color:var(--warn)">· 확인 필요 ${suspects}건</span>` : '');
@@ -491,13 +608,27 @@ function renderSegTable() {
       ⚠ 확인 필요: ${esc(s.no)} 와 ${esc(segs[i + 1].no)} 가 한 글자만 다릅니다. 같은 신고서를 잘못 읽었을 수 있어요. 아래 그림을 보고 고르세요.
       <button data-merge="${i}" data-use="a">${esc(s.no)} 로 합치기</button>
       <button data-merge="${i}" data-use="b">${esc(segs[i + 1].no)} 로 합치기</button></td></tr>` : '';
+    const choices = [s.no, ...s.conflicts].filter(Boolean);
+    const conflictRow = s.conflicts.length ? `<tr><td colspan="5" style="background:var(--warn-weak);color:var(--warn)">
+      ⚠ 확인 필요: 이 신고서 안에서 번호가 다르게 읽혔어요 (${choices.map(esc).join(' / ')}). 아래 그림을 보고 맞는 번호를 고르세요.
+      ${choices.map(no => `<button data-fix="${i}" data-no="${esc(no)}">${esc(no)}</button>`).join(' ')}</td></tr>` : '';
     return `<tr>
       <td><b>${i + 1}</b></td>
       <td class="mono">${esc(s.filename)}${s.no ? '' : ' <span style="color:var(--warn)">⚠ 번호 없음</span>'}</td>
       <td>${esc(s.file.name)}</td>
       <td>${a === b ? a : `${a}~${b}`} (${s.pages.length}장)</td>
-      <td><button data-seg="${i}">받기</button></td></tr>${warnRow}`;
+      <td><button data-seg="${i}">받기</button></td></tr>${conflictRow}${warnRow}`;
   }).join('');
+  $('segBody').querySelectorAll('button[data-fix]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const s = segs[+btn.dataset.fix];
+      for (const i of s.pages) {
+        const p = s.file.pages[i];
+        if (p.no) { p.no = btn.dataset.no; p.src = '수동'; }
+      }
+      renderResults();
+    });
+  });
   $('segBody').querySelectorAll('button[data-merge]').forEach(btn => {
     btn.addEventListener('click', () => {
       const a = segs[+btn.dataset.merge], b = segs[+btn.dataset.merge + 1];
@@ -518,7 +649,7 @@ function renderSegTable() {
   const starts = new Set(), orphans = new Set();
   for (const s of segs) {
     const fi = files.indexOf(s.file);
-    if (s.no) starts.add(`${fi}:${s.pages[0]}`);
+    if (!s.orphan) starts.add(`${fi}:${s.pages[0]}`);
     else s.pages.forEach(p => orphans.add(`${fi}:${p}`));
   }
   document.querySelectorAll('.card').forEach(card => {
@@ -527,7 +658,7 @@ function renderSegTable() {
     card.classList.toggle('orphan', orphans.has(key));
     const seg = segs.find(s => files.indexOf(s.file) === +card.dataset.f && s.pages.includes(+card.dataset.p));
     card.querySelector('.cont').textContent = starts.has(key) ? `→ ${seg.filename} 시작`
-      : orphans.has(key) ? '⚠ 앞에 신고번호가 없음' : `↳ ${seg.filename}에 이어짐`;
+      : orphans.has(key) ? '⚠ 앞에 신고서 첫 장이 없음' : `↳ ${seg.filename}에 이어짐`;
   });
 }
 
