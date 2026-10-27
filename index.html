@@ -346,17 +346,66 @@ async function getWorker() {
   return worker;
 }
 
-async function ocrPage(page) {
-  const roi = await renderRoi(page, +settings.dpi);
-  const w = await getWorker();
-  const { data } = await w.recognize(preprocess(roi, 'stretch'));
-  let found = findShingo(data.text);
-  // 번호 비슷한 흔적이 있을 때만 이진화로 한 번 더 (번호 없는 페이지는 빠르게 통과)
-  const hint = data.text.toUpperCase().replace(/\s/g, '').replace(/[OQDUILTJSBZG]/g, c => LOOKALIKE[c]);
-  if (!found && (/\d{2}-?\d{6}/.test(hint) || prefixList().some(p => hint.includes(p.slice(0, 3))))) {
-    found = findShingo((await w.recognize(preprocess(roi, 'binary'))).data.text);
+const digitize = text => text.toUpperCase().replace(/\s/g, '').replace(/[OQDUILTJSBZG]/g, c => LOOKALIKE[c]);
+const looksLikeNumber = text => {
+  const hint = digitize(text);
+  return /\d{2}-?\d{6}/.test(hint) || prefixList().some(p => hint.includes(p.slice(0, 3)));
+};
+
+// OCR 결과들에서 신고번호가 들어 있는 줄의 위치(bbox) 찾기. 신고인부호가 보이는 줄을 우선
+function findNumberLine(datas) {
+  const lines = datas.flatMap(d => (d.blocks || []).flatMap(b => b.paragraphs.flatMap(p => p.lines)));
+  const prefixes = prefixList();
+  const byPrefix = prefixes.length && lines.find(l => prefixes.some(p => digitize(l.text).includes(p.slice(0, 4))));
+  return (byPrefix || lines.find(l => looksLikeNumber(l.text)))?.bbox || null;
+}
+
+// 번호 줄만 300DPI로 잘라 3배 확대한 뒤 4가지 방식으로 읽고 다수결.
+// 9의 꼬리가 표 선에 붙어 0으로 읽히는 경우 등을 줄여줌 (실측: 530→539, 150→159 바로잡음)
+async function voteNumberLine(page, bbox, dpi, w) {
+  const roi = await renderRoi(page, 300);
+  const k = 300 / dpi, pad = 10, zoom = 3;
+  const x0 = bbox.x0 * k - pad, y0 = bbox.y0 * k - pad;
+  const bw = (bbox.x1 - bbox.x0) * k + pad * 2, bh = (bbox.y1 - bbox.y0) * k + pad * 2;
+  const c = document.createElement('canvas');
+  c.width = Math.round(bw * zoom); c.height = Math.round(bh * zoom);
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+  ctx.drawImage(roi, x0, y0, bw, bh, 0, 0, c.width, c.height);
+  const votes = new Map();
+  try {
+    for (const psm of ['6', '7']) {
+      await w.setParameters({ tessedit_pageseg_mode: psm });
+      for (const mode of ['stretch', 'binary']) {
+        const no = findShingo((await w.recognize(preprocess(c, mode))).data.text);
+        if (no) votes.set(no, (votes.get(no) || 0) + 1);
+      }
+    }
+  } finally {
+    await w.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.SINGLE_BLOCK });
   }
-  return { no: found, thumb: makeThumb(roi) };
+  let best = null, bestN = 0;
+  for (const [no, n] of votes) if (n > bestN) { best = no; bestN = n; }
+  return best;
+}
+
+async function ocrPage(page) {
+  const dpi = +settings.dpi;
+  const roi = await renderRoi(page, dpi);
+  const w = await getWorker();
+  const datas = [(await w.recognize(preprocess(roi, 'stretch'), {}, { blocks: true })).data];
+  let found = findShingo(datas[0].text);
+  const hasHint = looksLikeNumber(datas[0].text);
+  // 번호 비슷한 흔적이 있을 때만 이진화로 한 번 더 (번호 없는 페이지는 빠르게 통과)
+  if (!found && hasHint) {
+    datas.push((await w.recognize(preprocess(roi, 'binary'), {}, { blocks: true })).data);
+    found = findShingo(datas[1].text);
+  }
+  if (found || hasHint) {
+    const bbox = findNumberLine(datas);
+    if (bbox) found = (await voteNumberLine(page, bbox, dpi, w)) || found;
+  }
+  return { no: found };
 }
 
 // ───────── UNI-PASS 로고 찾기 ─────────
@@ -546,13 +595,39 @@ function allSegments() {
     used.set(name, n + 1);
     s.filename = (n ? `${name}_${n}` : name) + '.pdf';
   }
+  // 서로 다른 신고서가 같은 번호를 가질 수는 없으므로, 겹치면 어느 한쪽을 잘못 읽은 것
+  const counts = new Map();
+  for (const s of segs) if (s.no) counts.set(s.no, (counts.get(s.no) || 0) + 1);
+  const usedNos = new Set(counts.keys());
+  for (const s of segs) {
+    s.dup = !!s.no && counts.get(s.no) > 1;
+    s.gapGuesses = s.dup ? gapGuesses(s.no, usedNos) : [];
+  }
   return segs;
+}
+
+// 한 자리만 바꿨을 때 이번 묶음의 번호 범위 안에 비어 있는 번호가 되면 후보로 제안
+// 예: 142~165 중 150이 두 번, 159가 없으면 → 150의 한 자리를 바꾼 159를 제안
+function gapGuesses(no, used) {
+  const m = no.match(/^(\d{5}-\d{2}-)(\d{6})(.*)$/);
+  if (!m) return [];
+  const serials = [...used].map(u => u.match(/^(\d{5}-\d{2}-)(\d{6})/)).filter(x => x && x[1] === m[1]).map(x => +x[2]);
+  const lo = Math.min(...serials), hi = Math.max(...serials);
+  const out = [];
+  for (let i = 0; i < 6; i++) {
+    for (let d = 0; d <= 9; d++) {
+      if (String(d) === m[2][i]) continue;
+      const serial = m[2].slice(0, i) + d + m[2].slice(i + 1);
+      const cand = m[1] + serial + m[3];
+      if (+serial >= lo && +serial <= hi && !used.has(cand)) out.push(cand);
+    }
+  }
+  return out;
 }
 
 function renderResults() {
   if (!files.some(f => f.pages.length)) return;
   $('resultPanel').classList.remove('hidden');
-  renderSegTable();
   $('pageArea').innerHTML = files.filter(f => f.pages.length).map((f, fi) => `
     <div class="file-block">
       <h3>${esc(f.name)}</h3>
@@ -583,6 +658,8 @@ function renderResults() {
   $('pageArea').querySelectorAll('.card .startChk').forEach(chk => {
     chk.addEventListener('change', () => { pageOf(chk).start = chk.checked; renderResults(); });
   });
+  // 페이지 카드를 먼저 새로 그린 뒤 표를 그려야 카드 색칠이 지금 파일 기준으로 됨
+  renderSegTable();
 }
 
 // 한 글자만 다른 번호가 바로 다음 페이지에 있으면 같은 신고서를 잘못 읽었을 가능성이 큼
@@ -597,7 +674,7 @@ function isSuspectPair(a, b) {
 function renderSegTable() {
   const segs = allSegments();
   const noNum = segs.filter(s => !s.no).length;
-  const suspects = segs.filter((s, i) => isSuspectPair(s, segs[i + 1]) || s.conflicts.length).length;
+  const suspects = segs.filter((s, i) => isSuspectPair(s, segs[i + 1]) || s.conflicts.length || s.dup).length;
   $('segCount').innerHTML = `총 ${segs.length}개 PDF 파일`
     + (noNum ? ` <span style="color:var(--warn)">· 번호 없음 ${noNum}개</span>` : '')
     + (suspects ? ` <span style="color:var(--warn)">· 확인 필요 ${suspects}건</span>` : '');
@@ -612,12 +689,15 @@ function renderSegTable() {
     const conflictRow = s.conflicts.length ? `<tr><td colspan="5" style="background:var(--warn-weak);color:var(--warn)">
       ⚠ 확인 필요: 이 신고서 안에서 번호가 다르게 읽혔어요 (${choices.map(esc).join(' / ')}). 아래 그림을 보고 맞는 번호를 고르세요.
       ${choices.map(no => `<button data-fix="${i}" data-no="${esc(no)}">${esc(no)}</button>`).join(' ')}</td></tr>` : '';
+    const dupRow = s.dup ? `<tr><td colspan="5" style="background:var(--warn-weak);color:var(--warn)">
+      ⚠ 확인 필요: ${esc(s.no)} 번호가 다른 신고서에도 있어요. 둘 중 하나를 잘못 읽었을 수 있으니 아래 그림을 보고 번호를 고치세요.
+      ${s.gapGuesses.length ? `빠진 번호 후보: ${s.gapGuesses.map(no => `<button data-fix="${i}" data-no="${esc(no)}">${esc(no)} 로 바꾸기</button>`).join(' ')}` : ''}</td></tr>` : '';
     return `<tr>
       <td><b>${i + 1}</b></td>
       <td class="mono">${esc(s.filename)}${s.no ? '' : ' <span style="color:var(--warn)">⚠ 번호 없음</span>'}</td>
       <td>${esc(s.file.name)}</td>
       <td>${a === b ? a : `${a}~${b}`} (${s.pages.length}장)</td>
-      <td><button data-seg="${i}">받기</button></td></tr>${conflictRow}${warnRow}`;
+      <td><button data-seg="${i}">받기</button></td></tr>${conflictRow}${dupRow}${warnRow}`;
   }).join('');
   $('segBody').querySelectorAll('button[data-fix]').forEach(btn => {
     btn.addEventListener('click', () => {
