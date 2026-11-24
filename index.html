@@ -40,7 +40,9 @@
   .field { display: grid; gap: 4px; margin-bottom: 10px; }
   .field label { font-size: 12px; color: var(--muted); }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  input[type=text], select { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+  .engine-desc { font-size: 12px; color: var(--muted); background: var(--bg); border-radius: 6px; padding: 6px 8px; line-height: 1.5; }
+  .engine-desc b { color: var(--text); }
+  input[type=text], input[type=password], select { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
     background: var(--panel); color: var(--text); font: inherit; }
   input[type=range] { width: 100%; }
   .preview-wrap { position: relative; display: inline-block; border: 1px solid var(--line); max-width: 100%; }
@@ -82,7 +84,8 @@
 <body>
 <header>
   <h1>📄 신고번호 PDF 분할기</h1>
-  <p>스캔한 PDF의 좌측 상단 신고번호를 읽어 신고번호별 PDF로 나눕니다. 파일은 이 PC 브라우저 안에서만 처리됩니다.</p>
+  <p>스캔한 PDF의 좌측 상단 신고번호를 읽어 신고번호별 PDF로 나눕니다. 파일은 이 PC 브라우저 안에서만 처리됩니다.
+    (OCR 방식을 자동·Claude로 고르면 번호 영역 이미지만 Anthropic으로 보냅니다.)</p>
 </header>
 <main>
   <section class="panel">
@@ -111,6 +114,30 @@
             <option value="200">200 DPI (권장)</option>
             <option value="300">300 DPI (정밀, 느림)</option>
           </select>
+        </div>
+        <div class="field">
+          <label>OCR 방식</label>
+          <div class="purpose" id="ocrEngine" style="justify-self:start">
+            <button data-engine="free">무료</button>
+            <button data-engine="auto">자동</button>
+            <button data-engine="claude">Claude</button>
+          </div>
+          <div class="engine-desc" id="engineDesc"></div>
+        </div>
+        <div id="claudeBox" class="hidden">
+          <div class="field">
+            <label>Claude 모델</label>
+            <select id="claudeModel"></select>
+          </div>
+          <div class="field">
+            <label>Claude API 키 (이 PC 브라우저에만 저장되고, 화면이나 기록에는 나오지 않습니다)</label>
+            <div class="row">
+              <input type="password" id="claudeKey" placeholder="sk-ant-..." autocomplete="off" spellcheck="false" style="flex:1;min-width:180px">
+              <button id="keyTest">연결 확인</button>
+              <button id="keyDel">지우기</button>
+            </div>
+            <div class="muted" id="keyStatus"></div>
+          </div>
         </div>
         <div class="field">
           <label>읽을 영역 — 가로 <b id="wVal"></b>% · 세로 <b id="hVal"></b>% (좌측 상단 기준)</label>
@@ -181,7 +208,8 @@
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
 const $ = id => document.getElementById(id);
-const DEFAULTS = { prefix: '43632', suffix: 'M', dpi: '200', roiW: 60, roiH: 25, forceOcr: false, useLogo: true, purpose: 'both' };
+const DEFAULTS = { prefix: '43632', suffix: 'M', dpi: '200', roiW: 60, roiH: 25, forceOcr: false, useLogo: true, purpose: 'both',
+  ocrEngine: 'free', claudeModel: 'claude-haiku-5-5' };
 const settings = loadSettings();
 let files = [];      // { name, buf, pdf, pages: [{ no, src, thumb, logo, start }] }
 let worker = null;
@@ -218,6 +246,72 @@ function bindSettings() {
   };
   ['prefix', 'suffix', 'dpi', 'roiW', 'roiH', 'forceOcr', 'useLogo'].forEach(id => $(id).addEventListener('input', sync));
   sync();
+  bindClaudeSettings();
+}
+
+// ───────── OCR 방식 · Claude 설정 ─────────
+// 가격은 100만 토큰당 달러. 페이지당 금액은 번호 영역 이미지 1장(입력 약 1,000토큰) 기준 대략치
+const CLAUDE_MODELS = {
+  'claude-haiku-5-5': { label: 'Haiku 5.5 (권장 · 가장 저렴)', inUsd: 0.10, outUsd: 0.50, perPage: '페이지당 약 0.2원' },
+  'claude-sonnet-5-5': { label: 'Sonnet 5.5 (중간)', inUsd: 2, outUsd: 10, perPage: '페이지당 약 4원' },
+  'claude-opus-5-5': { label: 'Opus 5.5 (가장 정확 · 비쌈)', inUsd: 4, outUsd: 20, perPage: '페이지당 약 10원' },
+};
+const KRW_PER_USD = 1400;
+const KEY_STORE = 'shingoSplitClaudeKey';
+const ENGINE_DESC = {
+  free: '<b>무료</b> — 이 PC 안에서 Tesseract OCR로 읽습니다. 비용이 없고 외부로 아무것도 보내지 않습니다.',
+  auto: '<b>자동</b> — 무료 OCR로 먼저 읽고, 번호를 못 찾았거나 여러 번 읽은 결과가 엇갈린 페이지만 Claude가 다시 읽습니다. '
+    + '그 페이지의 번호 영역 이미지만 Anthropic으로 보내므로 비용이 가장 적게 듭니다.',
+  claude: '<b>Claude</b> — 번호를 읽어야 하는 페이지를 모두 Claude가 읽습니다. 가장 정확하지만 페이지마다 번호 영역 이미지를 '
+    + 'Anthropic으로 보내고 API 비용이 듭니다. (Claude가 실패한 페이지는 무료 OCR로 다시 읽습니다)',
+};
+
+function getClaudeKey() { try { return localStorage.getItem(KEY_STORE) || ''; } catch { return ''; } }
+function setClaudeKey(k) { try { k ? localStorage.setItem(KEY_STORE, k) : localStorage.removeItem(KEY_STORE); } catch {} }
+
+function bindClaudeSettings() {
+  $('claudeModel').innerHTML = Object.entries(CLAUDE_MODELS)
+    .map(([id, m]) => `<option value="${id}">${m.label} · ${m.perPage}</option>`).join('');
+  if (!CLAUDE_MODELS[settings.claudeModel]) settings.claudeModel = DEFAULTS.claudeModel;
+  $('claudeModel').value = settings.claudeModel;
+  $('claudeModel').addEventListener('input', () => { settings.claudeModel = $('claudeModel').value; saveSettings(); });
+  $('ocrEngine').querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+    settings.ocrEngine = b.dataset.engine; saveSettings(); renderEngine();
+  }));
+  $('claudeKey').value = getClaudeKey();
+  $('claudeKey').addEventListener('change', () => {
+    setClaudeKey($('claudeKey').value.trim());
+    $('keyStatus').textContent = getClaudeKey() ? '저장됨. [연결 확인]으로 키가 맞는지 확인해 보세요.' : '';
+    renderEngine();
+  });
+  $('keyDel').addEventListener('click', () => {
+    setClaudeKey(''); $('claudeKey').value = ''; $('keyStatus').textContent = '이 PC에서 키를 지웠습니다.'; renderEngine();
+  });
+  $('keyTest').addEventListener('click', testClaudeKey);
+  renderEngine();
+}
+
+function renderEngine() {
+  if (!ENGINE_DESC[settings.ocrEngine]) settings.ocrEngine = DEFAULTS.ocrEngine;
+  $('ocrEngine').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.engine === settings.ocrEngine));
+  const useClaude = settings.ocrEngine !== 'free';
+  $('claudeBox').classList.toggle('hidden', !useClaude);
+  $('engineDesc').innerHTML = ENGINE_DESC[settings.ocrEngine]
+    + (useClaude && !getClaudeKey() ? '<br>⚠️ 아래에 API 키를 넣어야 Claude가 작동합니다. 키가 없으면 무료 OCR로만 처리합니다.' : '');
+}
+
+async function testClaudeKey() {
+  setClaudeKey($('claudeKey').value.trim());
+  renderEngine();
+  if (!getClaudeKey()) { $('keyStatus').textContent = 'API 키를 먼저 넣어 주세요.'; return; }
+  $('keyStatus').textContent = '확인 중...';
+  try {
+    // 모델 정보 조회는 토큰을 쓰지 않으므로 비용 없이 키만 확인됨
+    await (await getClaude()).models.retrieve(settings.claudeModel);
+    $('keyStatus').textContent = '✅ 연결됨 — 키가 정상입니다. (확인에는 비용이 들지 않습니다)';
+  } catch (err) {
+    $('keyStatus').textContent = '❌ ' + claudeError(err).text;
+  }
 }
 
 // ───────── 파일 선택 ─────────
@@ -410,7 +504,7 @@ async function voteNumberLine(page, bbox, dpi, w) {
   }
   let best = null, bestN = 0;
   for (const [no, n] of votes) if (n > bestN) { best = no; bestN = n; }
-  return best;
+  return { no: best, n: bestN };
 }
 
 async function ocrPage(page) {
@@ -425,11 +519,95 @@ async function ocrPage(page) {
     datas.push((await w.recognize(preprocess(roi, 'binary'), {}, { blocks: true })).data);
     found = findShingo(datas[1].text);
   }
+  // sure: 번호 줄을 4번 읽어 3번 이상 같은 번호가 나왔을 때만 확실하다고 봄 (자동 모드에서 Claude에 넘길지 판단)
+  let sure = false;
   if (found || hasHint) {
     const bbox = findNumberLine(datas);
-    if (bbox) found = (await voteNumberLine(page, bbox, dpi, w)) || found;
+    if (bbox) {
+      const v = await voteNumberLine(page, bbox, dpi, w);
+      if (v.no) { found = v.no; sure = v.n >= 3; }
+    }
   }
-  return { no: found };
+  return { no: found, sure, hint: hasHint };
+}
+
+// ───────── Claude OCR ─────────
+// 공식 Anthropic SDK를 Claude를 처음 쓸 때만 불러옴 (무료 모드에서는 받지 않음)
+const CLAUDE_SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@1.6.0/+esm';
+const CLAUDE_PROMPT = '이 이미지는 한국 수입·수출신고서(또는 신고필증) 첫 장의 좌측 상단입니다. '
+  + "'신고번호' 칸에 인쇄된 신고번호를 읽어 주세요. 형식은 5자리-2자리-6자리 뒤에 영문 1자입니다 (예: 43632-26-303166M). "
+  + 'File No, B/L 번호, 화물관리번호 같은 다른 번호는 무시하세요. 숫자를 한 자리씩 정확히 읽고, '
+  + '답은 신고번호만 한 줄로 쓰세요. 신고번호가 보이지 않으면 NONE 이라고만 쓰세요.';
+let claudeSdk = null, claudeClient = null, claudeClientKey = '';
+let claudeOff = '';   // 이번 실행에서 Claude를 더 쓰지 않기로 한 이유 (키 오류·한도 초과 등)
+const claudeUsage = { pages: 0, inTok: 0, outTok: 0, usd: 0 };
+
+async function getClaude() {
+  const key = getClaudeKey();
+  if (!key) throw new Error('API 키가 없습니다');
+  if (!claudeSdk) claudeSdk = await import(CLAUDE_SDK_URL);
+  if (!claudeClient || claudeClientKey !== key) {
+    const Anthropic = claudeSdk.default;
+    // 키는 각 사용자 PC 브라우저에만 저장됨. 공개 코드에는 키가 없음
+    claudeClient = new Anthropic({ apiKey: key, dangerouslyAllowBrowser: true, maxRetries: 2 });
+    claudeClientKey = key;
+  }
+  return claudeClient;
+}
+
+// fatal: 이번 실행 동안 Claude를 끄고 무료 OCR로만 처리해야 하는 오류
+function claudeError(err) {
+  const A = claudeSdk && claudeSdk.default;
+  const msg = (err && (err.error?.error?.message || err.message)) || String(err);
+  if (A && err instanceof A.AuthenticationError) return { fatal: true, text: 'API 키가 올바르지 않거나 만료·삭제되었습니다.' };
+  if (A && err instanceof A.PermissionDeniedError) return { fatal: true, text: '이 API 키로는 사용할 수 없습니다 (권한 없음).' };
+  if (A && err instanceof A.NotFoundError) return { fatal: true, text: '선택한 모델을 찾을 수 없습니다. 다른 모델을 골라 주세요.' };
+  if (/usage limits/i.test(msg) || err?.error?.error?.error_code === 'enforced_spend_limit_reached')
+    return { fatal: true, text: '이번 달 API 사용 한도에 도달했습니다. 다음 달 1일에 다시 쓸 수 있습니다.' };
+  if (err?.type === 'billing_error' || /credit balance/i.test(msg))
+    return { fatal: true, text: 'API 크레딧 잔액이 부족합니다.' };
+  if (A && err instanceof A.RateLimitError) return { fatal: false, text: '요청이 너무 많아 잠시 거절되었습니다.' };
+  if (A && err instanceof A.APIConnectionError) return { fatal: false, text: '인터넷 연결 문제로 Claude에 접속하지 못했습니다.' };
+  if (!claudeSdk) return { fatal: true, text: `Claude 연결 도구를 불러오지 못했습니다 (${msg})` };
+  return { fatal: false, text: msg };
+}
+
+function addClaudeUsage(res, model) {
+  const price = CLAUDE_MODELS[res.model] || CLAUDE_MODELS[model];
+  const u = res.usage || {};
+  const inTok = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+  const outTok = u.output_tokens || 0;
+  claudeUsage.pages++; claudeUsage.inTok += inTok; claudeUsage.outTok += outTok;
+  claudeUsage.usd += (inTok * price.inUsd + outTok * price.outUsd) / 1e6;
+}
+
+// 번호 영역 이미지 한 장만 보내고, 돌아온 글자는 무료 OCR과 같은 형식 검사(findShingo)를 거침
+async function claudeRead(page) {
+  const client = await getClaude();
+  const model = settings.claudeModel;
+  const roi = await renderRoi(page, +settings.dpi);
+  const data = roi.toDataURL('image/jpeg', 0.9).split(',')[1];
+  const params = {
+    model,
+    max_tokens: model === 'claude-haiku-5-5' ? 200 : 2000,
+    output_config: { effort: 'low' },   // 번호 읽기는 단순 작업이라 생각을 최소로 (비용 절감)
+    messages: [{ role: 'user', content: [
+      { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data } },
+      { type: 'text', text: CLAUDE_PROMPT },
+    ] }],
+  };
+  let res;
+  if (model === 'claude-haiku-5-5') {
+    res = await client.messages.create({ ...params, thinking: { type: 'disabled' } });
+  } else {
+    // Sonnet·Opus: 드물게 안전 필터가 거절하면 서버가 다른 모델로 자동 재시도
+    if (model === 'claude-sonnet-5-5') params.thinking = { type: 'between_tools' };
+    res = await client.beta.messages.create({ ...params, betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' });
+  }
+  addClaudeUsage(res, model);
+  if (res.stop_reason === 'refusal') return null;
+  const text = res.content.filter(b => b.type === 'text').map(b => b.text).join(' ');
+  return findShingo(text);
 }
 
 // ───────── UNI-PASS 로고 찾기 ─────────
@@ -624,6 +802,15 @@ async function run() {
   let done = 0;
   const tick = () => { done++; $('bar').style.width = Math.min(100, done / total * 100) + '%'; };
   const t0 = performance.now();
+  // OCR 방식: 키가 없으면 자동·Claude를 골라도 무료로 처리
+  let engine = settings.ocrEngine;
+  claudeOff = '';
+  Object.assign(claudeUsage, { pages: 0, inTok: 0, outTok: 0, usd: 0 });
+  if (engine !== 'free' && !getClaudeKey()) {
+    log('⚠️ Claude API 키가 없어서 무료 OCR로만 처리합니다.');
+    engine = 'free';
+  }
+  if (engine !== 'free') log(`🤖 OCR 방식: ${engine === 'auto' ? '자동' : 'Claude'} · ${CLAUDE_MODELS[settings.claudeModel].label}`);
   if (settings.useLogo) await loadLogo();
   for (const f of files) {
     log(`\n📄 ${f.name}`);
@@ -667,8 +854,35 @@ async function run() {
       if (stopFlag) break;
       $('status').textContent = `${f.name} · 번호 읽는 중 ${i + 1}/${n}페이지`;
       try {
-        const r = await ocrPage(await f.pdf.getPage(i + 1));
-        if (r.no) { f.pages[i].no = r.no; f.pages[i].src = 'OCR'; }
+        const page = await f.pdf.getPage(i + 1);
+        let r = { no: null, sure: false, hint: false };
+        if (engine !== 'claude') {
+          r = await ocrPage(page);
+          if (r.no) { f.pages[i].no = r.no; f.pages[i].src = 'OCR'; }
+        }
+        // 자동: 확실하지 않은 페이지만 Claude에게 (로고가 있으면 신고서 첫 장만, 없으면 번호 흔적이 있는 페이지만)
+        const wantClaude = engine === 'claude'
+          || (engine === 'auto' && !r.sure && (logoMode ? f.pages[i].logo : !!(r.no || r.hint)));
+        let byClaude = null;
+        if (wantClaude && !claudeOff && !stopFlag) {
+          $('status').textContent = `${f.name} · Claude가 번호 읽는 중 ${i + 1}/${n}페이지`;
+          try {
+            byClaude = await claudeRead(page);
+            if (byClaude) {
+              if (r.no && r.no !== byClaude) log(`  🤖 ${i + 1}페이지: 무료 OCR ${r.no} → Claude ${byClaude}`);
+              f.pages[i].no = byClaude; f.pages[i].src = 'Claude';
+            }
+          } catch (err) {
+            const e = claudeError(err);
+            log(`  ⚠️ ${i + 1}페이지 Claude 오류: ${e.text}`);
+            if (e.fatal) { claudeOff = e.text; log('  → 남은 페이지는 무료 OCR로만 처리합니다.'); }
+          }
+        }
+        // Claude 모드에서 Claude가 못 읽은 페이지는 무료 OCR로 한 번 더
+        if (engine === 'claude' && !byClaude && !stopFlag) {
+          r = await ocrPage(page);
+          if (r.no) { f.pages[i].no = r.no; f.pages[i].src = 'OCR'; }
+        }
       } catch (err) {
         log(`  ⚠️ ${i + 1}페이지 오류: ${err.message}`);
       }
@@ -682,7 +896,17 @@ async function run() {
   }
   if (!stopFlag && settings.purpose !== 'keep') await classifyAll();
   const sec = ((performance.now() - t0) / 1000).toFixed(1);
-  $('status').textContent = stopFlag ? '중지됨' : `완료 (${sec}초)`;
+  let usageText = '';
+  if (claudeUsage.pages) {
+    const won = claudeUsage.usd * KRW_PER_USD;
+    usageText = ` · Claude ${claudeUsage.pages}페이지 약 ${won < 1 ? won.toFixed(2) : Math.round(won).toLocaleString()}원`;
+    log(`\n🤖 Claude 사용: ${claudeUsage.pages}페이지 · 입력 ${claudeUsage.inTok.toLocaleString()} / 출력 ${claudeUsage.outTok.toLocaleString()} 토큰`
+      + ` · 약 $${claudeUsage.usd.toFixed(4)} (약 ${(claudeUsage.usd * KRW_PER_USD).toFixed(1)}원)`);
+  } else if (engine !== 'free' && !stopFlag) {
+    log(claudeOff ? `\n🤖 Claude를 쓰지 못했습니다: ${claudeOff} (비용 0원)` : '\n🤖 Claude에 보낸 페이지가 없습니다 (비용 0원)');
+  }
+  if (claudeOff) usageText += ' · ⚠️ Claude 사용 불가 (기록 참고)';
+  $('status').textContent = stopFlag ? '중지됨' : `완료 (${sec}초)${usageText}`;
   $('runBtn').disabled = false; $('stopBtn').disabled = true;
   renderResults();
 }
