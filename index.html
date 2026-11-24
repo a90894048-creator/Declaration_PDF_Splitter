@@ -1023,7 +1023,10 @@ function classifyHeader(h, logo) {
   if (logo) return { act: 'del', title: /수입신고서/.test(h.text) && !/견본/.test(h.text) ? '수입신고서' : '견본(수입) / 수입신고서' };
   for (const [title, re] of DEL_DOCS) if (re.test(h.text)) return { act: 'del', title };
   // 제목처럼 한 줄 전체가 INVOICE 인 경우만 인정 (패킹리스트의 "No. & date of invoice" 같은 칸 이름 제외)
-  const titleLine = h.lines.find(l => /^.{0,4}(COMMERCIAL)?INVOICE.{0,4}$/.test(l));
+  // 상자 안 제목이 옆 칸 글자와 한 줄로 붙어 읽히는 경우(예: 'BEAUTY WORLD' + 'COMMERCIAL INVOICE')는
+  // 줄 끝이 COMMERCIAL INVOICE 로 끝나면 인정 ('COMMERCIAL INVOICE NO.' 같은 칸 이름은 뒤에 글자가 더 있어 제외)
+  const titleLine = h.lines.find(l => /^.{0,4}(COMMERCIAL)?INVOICE.{0,4}$/.test(l))
+    || h.lines.find(l => /COMMERCIALINVOICE.?$/.test(l));
   if (titleLine) {
     if (titleLine.includes('COMMERCIAL')) return { act: 'front', title: 'COMMERCIAL INVOICE' };
     // 위쪽에 한글이 안 보여도 본문까지 확인해야 함 (classifyAll 에서 페이지 전체를 읽음)
