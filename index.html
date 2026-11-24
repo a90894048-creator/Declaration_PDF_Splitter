@@ -70,7 +70,15 @@
   .purpose { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
   .purpose button { border: 0; border-radius: 0; }
   .purpose button.on { background: var(--accent); color: #fff; font-weight: bold; }
-  .card img { width: 100%; display: block; border: 1px solid var(--line); background: #fff; min-height: 40px; }
+  .card img { width: 100%; display: block; border: 1px solid var(--line); background: #fff; min-height: 40px; cursor: zoom-in; }
+  .zoom { position: fixed; inset: 0; z-index: 50; background: rgba(0, 0, 0, .92); display: flex; flex-direction: column;
+    align-items: center; padding: 16px; gap: 10px; }
+  .zoom .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center; color: #fff; max-width: 100%; }
+  .zoom .bar button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .zoom .view { flex: 1; min-height: 0; width: min(1240px, 100%); overflow: auto; background: #fff; border-radius: 6px; }
+  .zoom .view img { display: block; width: 100%; cursor: zoom-in; }
+  .zoom .view img.full { width: auto; max-width: none; cursor: zoom-out; }
+  .zoom .alt-pick button { font-family: Consolas, monospace; }
   .card .meta { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin: 6px 0 4px; }
   .card input { width: 100%; font-family: Consolas, monospace; }
   .card .cont { font-size: 11px; color: var(--muted); margin-top: 4px; }
@@ -204,6 +212,17 @@
       <tbody id="segBody"></tbody>
     </table>
     <div id="pageArea"></div>
+  </section>
+
+  <section class="zoom hidden" id="zoom">
+    <div class="bar">
+      <b id="zoomTitle"></b>
+      <button data-zoom="roi" class="on">번호 영역</button>
+      <button data-zoom="page">페이지 전체</button>
+      <button id="zoomClose">닫기 (Esc)</button>
+    </div>
+    <div class="bar alt-pick" id="zoomAlt"></div>
+    <div class="view" id="zoomView"><span style="padding:20px;display:block">불러오는 중...</span></div>
   </section>
 </main>
 
@@ -1052,6 +1071,10 @@ function renderResults() {
       renderResults();
     });
   });
+  $('pageArea').querySelectorAll('.card img').forEach(img => {
+    img.title = '클릭하면 크게 봅니다';
+    img.addEventListener('click', () => { const card = img.closest('.card'); openZoom(+card.dataset.f, +card.dataset.p); });
+  });
   $('pageArea').querySelectorAll('.card button[data-alt]').forEach(btn => {
     btn.addEventListener('click', () => { const p = pageOf(btn); p.no = btn.dataset.alt; p.src = '수동'; delete p.alt; renderResults(); });
   });
@@ -1061,6 +1084,61 @@ function renderResults() {
   // 페이지 카드를 먼저 새로 그린 뒤 표를 그려야 카드 색칠이 지금 파일 기준으로 됨
   renderSegTable();
 }
+
+// ───────── 페이지 크게 보기 ─────────
+// 카드 그림은 작아서 번호를 읽기 어려우므로, 클릭하면 원본 PDF에서 고해상도로 다시 그려 보여줌
+let zoomAt = null, zoomMode = 'roi', zoomSeq = 0;
+async function openZoom(fi, pi) {
+  zoomAt = { fi, pi };
+  $('zoom').classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+  await drawZoom();
+}
+function closeZoom() {
+  zoomAt = null;
+  $('zoom').classList.add('hidden');
+  document.body.style.overflow = '';
+  $('zoomView').innerHTML = '';
+}
+async function drawZoom() {
+  if (!zoomAt) return;
+  const seq = ++zoomSeq;
+  const f = files[zoomAt.fi], p = f.pages[zoomAt.pi];
+  $('zoomTitle').textContent = `${f.name} · ${zoomAt.pi + 1}페이지${p.no ? ` · ${p.no}` : ''}`;
+  $('zoom').querySelectorAll('[data-zoom]').forEach(b => b.classList.toggle('on', b.dataset.zoom === zoomMode));
+  $('zoomAlt').innerHTML = p.alt ? `<span>⚠ 읽은 결과가 달라요:</span>
+    <button data-pick="${esc(p.alt.claude)}">Claude ${esc(p.alt.claude)}</button>
+    <button data-pick="${esc(p.alt.ocr)}">무료 OCR ${esc(p.alt.ocr)}</button>` : '';
+  $('zoomAlt').querySelectorAll('[data-pick]').forEach(b => b.addEventListener('click', () => {
+    p.no = b.dataset.pick; p.src = '수동'; delete p.alt; closeZoom(); renderResults();
+  }));
+  $('zoomView').innerHTML = '<span style="padding:20px;display:block;color:#333">불러오는 중...</span>';
+  const page = await f.pdf.getPage(zoomAt.pi + 1);
+  let canvas;
+  if (zoomMode === 'roi') {
+    canvas = await renderRoi(page, 250);   // 번호 영역만 250 DPI
+  } else {
+    const vp = page.getViewport({ scale: 150 / 72 });
+    canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(vp.width); canvas.height = Math.ceil(vp.height);
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+  }
+  if (seq !== zoomSeq || !zoomAt) return;   // 그리는 동안 다른 페이지로 바뀌었으면 버림
+  const img = new Image();
+  img.src = canvas.toDataURL('image/png');
+  img.alt = `${zoomAt.pi + 1}페이지 크게 보기`;
+  // 처음엔 창 너비에 맞추고, 그림을 누르면 원래 크기(더 크게)로 바꿈
+  img.title = '그림을 누르면 원래 크기로 더 크게 봅니다';
+  img.addEventListener('click', () => img.classList.toggle('full'));
+  $('zoomView').innerHTML = '';
+  $('zoomView').appendChild(img);
+}
+$('zoom').querySelectorAll('[data-zoom]').forEach(b => b.addEventListener('click', () => { zoomMode = b.dataset.zoom; drawZoom(); }));
+$('zoomClose').addEventListener('click', closeZoom);
+$('zoom').addEventListener('click', e => { if (e.target === $('zoom')) closeZoom(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && zoomAt) closeZoom(); });
 
 // 한 글자만 다른 번호가 바로 다음 페이지에 있으면 같은 신고서를 잘못 읽었을 가능성이 큼
 function isSuspectPair(a, b) {
