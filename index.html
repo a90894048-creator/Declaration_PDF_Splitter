@@ -815,17 +815,19 @@ function redInk(canvas) {
 }
 const RED_INK_MIN = 2;
 
-const BL_PROMPT = '이 이미지는 수입 서류 스캔본 한 페이지의 윗부분입니다. 다음을 알려 주세요.\n'
-  + '1) is_bl: 이 페이지가 B/L(선하증권, Bill of Lading, House/Master B/L, Air Waybill 포함)의 첫 장인지\n'
-  + '2) bl_numbers: 인쇄된 B/L 번호를 보이는 대로 모두 (B/L No., M.B/L, H.B/L, AWB No. 등, 바코드 아래 숫자 포함)\n'
+const BL_PROMPT = '이 이미지는 수입 서류 스캔본 한 페이지(또는 그 윗부분)입니다. 다음을 알려 주세요.\n'
+  + '1) is_bl: 이 페이지가 B/L(선하증권, Bill of Lading, House/Master B/L, Air Waybill, 화물 도착통지·인도지시서 포함)의 첫 장인지\n'
+  + '2) bl_numbers: 인쇄된 B/L 번호를 보이는 대로 모두. B/L No., M.B/L, H.B/L, AWB No., Ref No. 옆에 있는 번호를 '
+  + '표의 칸이나 테두리 상자 안에 들어 있어도 빠짐없이 적고, 바코드 아래 숫자도 포함하세요. 라벨(B/L No. 등)은 빼고 번호만 적으세요.\n'
   + '3) handwritten: 페이지 위쪽 여백에 손으로 쓴(대개 빨간색) 6자리 숫자가 있으면 그 숫자, 없으면 null\n'
   + '글자는 한 자씩 정확히 읽고, 1과 I, 0과 O처럼 헷갈리는 글자도 보이는 모양대로 적으세요.\n'
   + '다른 말 없이 JSON 한 줄로만 답하세요: {"is_bl": true, "bl_numbers": ["..."], "handwritten": "123456"}';
 
-async function claudeReadBl(page) {
+// whole: false = 위쪽 45%만(150 DPI), true = 페이지 전체(110 DPI, 토큰 수는 비슷하게 유지)
+async function claudeReadBl(page, whole = false) {
   const client = await getClaude();
   const model = settings.claudeModel;
-  const img = await renderTop(page, 150, 0.45);
+  const img = whole ? await renderTop(page, 110, 1) : await renderTop(page, 150, 0.45);
   const data = img.toDataURL('image/jpeg', 0.85).split(',')[1];
   const params = {
     model,
@@ -860,6 +862,12 @@ async function claudeReadBl(page) {
 }
 
 // 한 페이지 결과를 엑셀과 맞춰 봄. B/L 번호와 빨간 숫자가 서로 다른 신고번호를 가리키면 확인 필요로 표시
+// 읽은 B/L 번호나 빨간 숫자로 엑셀 행을 찾을 수 있는지
+function blFound(r) {
+  const m = r.bls.length ? matchBl(r.bls) : null;
+  if (m && m.how !== '한 글자 차이') return true;
+  return !!r.red && excelRows.filter(x => x.serial === r.red).length === 1;
+}
 function applyBlResult(p, i, r) {
   let byBl = r.bls.length ? matchBl(r.bls) : null;
   const redHits = r.red ? excelRows.filter(x => x.serial === r.red) : [];
@@ -1125,7 +1133,14 @@ async function run() {
       if (!claudeOff) {
         $('status').textContent = `${f.name} · Claude가 B/L 읽는 중 ${i + 1}/${n}페이지`;
         try {
-          const r = await claudeReadBl(await f.pdf.getPage(i + 1));
+          const page = await f.pdf.getPage(i + 1);
+          let r = await claudeReadBl(page);
+          // 위쪽에서 엑셀과 맞는 B/L·빨간 숫자를 못 찾으면 페이지 전체를 한 번 더 읽음 (B/L 번호가 아래쪽 상자 안에 있는 양식 등)
+          if (!r || !blFound(r)) {
+            $('status').textContent = `${f.name} · Claude가 페이지 전체를 다시 읽는 중 ${i + 1}/${n}페이지`;
+            const r2 = await claudeReadBl(page, true);
+            if (r2) r = r ? { isBl: r.isBl || r2.isBl, bls: [...new Set([...r.bls, ...r2.bls])], red: r.red || r2.red } : r2;
+          }
           if (r) { applyBlResult(p, i, r); p.start = p.start || marked; }
           else if (marked) log(`  ⚠️ ${i + 1}페이지: Claude 답을 이해하지 못했습니다. 번호를 직접 넣어 주세요.`);
         } catch (err) {
