@@ -2,3 +2,10 @@
 *.pdf
 *.PDF
 *.zip
+
+# 엑셀(B/L·신고번호 자료)도 개인정보라 올리지 않음
+*.xls
+*.xlsx
+*.XLS
+*.XLSX
+.claude/

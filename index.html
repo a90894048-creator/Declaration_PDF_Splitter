@@ -1085,15 +1085,38 @@ const DEL_DOCS = [
   ['수입신고서', /수입신고서/],
 ];
 const PURPOSE_NAME = { keep: '보관용', sub: '사후제출용' };
-let korWorker = null;
+// 한글 OCR 엔진 수: CPU 4스레드마다 1개, 1~3개 (사양이 낮은 PC는 1개라 지금과 같고, 좋은 PC만 더 띄움)
+const KOR_POOL = Math.max(1, Math.min(3, Math.floor((navigator.hardwareConcurrency || 4) / 4)));
+let korSched = null;
 
-async function getKorWorker() {
-  if (korWorker) return korWorker;
-  log('🔤 한글 OCR 준비 중... (처음 한 번은 인터넷에서 받아옵니다)');
-  korWorker = await Tesseract.createWorker(['kor', 'eng'], 1);
-  // 자동 배치 분석: 상자 안에 든 제목(COMMERCIAL INVOICE 등)도 따로 찾아 읽음
-  await korWorker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.AUTO });
-  return korWorker;
+function getKorScheduler() {
+  if (korSched) return korSched;
+  log(`🔤 한글 OCR 준비 중... (처음 한 번은 인터넷에서 받아옵니다 · 동시에 ${KOR_POOL}개)`);
+  korSched = (async () => {
+    const s = Tesseract.createScheduler();
+    const ws = await Promise.all(Array.from({ length: KOR_POOL }, async () => {
+      const w = await Tesseract.createWorker(['kor', 'eng'], 1);
+      // 자동 배치 분석: 상자 안에 든 제목(COMMERCIAL INVOICE 등)도 따로 찾아 읽음
+      await w.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.AUTO });
+      return w;
+    }));
+    ws.forEach(w => s.addWorker(w));
+    return s;
+  })();
+  korSched.catch(() => { korSched = null; });
+  return korSched;
+}
+const korRecognize = async c => (await getKorScheduler()).addJob('recognize', c, {}, { blocks: true });
+
+// 페이지 위쪽 읽기 결과는 페이지 그림에만 달려 있으므로 파일마다 한 번만 읽고 저장해 둠
+// (B/L 기준에서는 Claude가 읽는 동안 미리 읽어 둠)
+function headerOf(f, i) {
+  f.heads ??= [];
+  if (!f.heads[i]) {
+    f.heads[i] = f.pdf.getPage(i + 1).then(readHeader);
+    f.heads[i].catch(() => { f.heads[i] = null; });
+  }
+  return f.heads[i];
 }
 
 // 페이지 위쪽 25%(제목 부분)를 한글+영문으로 읽음. 인보이스 제목이 조금 아래에 있는 경우가 있어 25%
@@ -1104,12 +1127,13 @@ async function readHeader(page) {
   const ctx = c.getContext('2d');
   ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
   await page.render({ canvasContext: ctx, viewport: vp }).promise;
-  const { data } = await (await getKorWorker()).recognize(c, {}, { blocks: true });
+  const thumb = makeThumb(c);
+  const { data } = await korRecognize(c);
   const words = (data.blocks || []).flatMap(b => b.paragraphs.flatMap(p => p.lines.flatMap(l => l.words)));
   // 영문 서류에서 한글이 잘못 섞여 나오는 것을 막으려고 확실히 읽힌 글자만 셈
   const hangul = words.filter(w => w.confidence >= 70).reduce((n, w) => n + (w.text.match(/[가-힣]/g) || []).length, 0);
   const lines = (data.blocks || []).flatMap(b => b.paragraphs.flatMap(p => p.lines)).map(l => fixCommercial(l.text.toUpperCase().replace(/[^A-Z]/g, '')));
-  return { text: data.text.replace(/\s/g, ''), hangul, lines, thumb: makeThumb(c) };
+  return { text: data.text.replace(/\s/g, ''), hangul, lines, thumb: await thumb };
 }
 
 // 두 낱말이 몇 글자 다른지 (글자 바꿈·빠짐·더함 횟수)
@@ -1144,7 +1168,7 @@ async function bodyHangulWords(page) {
   const ctx = c.getContext('2d');
   ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
   await page.render({ canvasContext: ctx, viewport: vp }).promise;
-  const { data } = await (await getKorWorker()).recognize(c, {}, { blocks: true });
+  const { data } = await korRecognize(c);
   const words = (data.blocks || []).flatMap(b => b.paragraphs.flatMap(p => p.lines.flatMap(l => l.words)));
   return words.filter(w => w.confidence >= 70 && /[가-힣]{2,}/.test(w.text)).length;
 }
@@ -1174,21 +1198,21 @@ async function classifyAll() {
   $('runBtn').disabled = true;
   classifying = true; renderFileChips();
   let n = 0;
-  for (const [f, p, i] of todo) {
-    $('status').textContent = `서류 종류 읽는 중 ${++n}/${todo.length}페이지 (사후제출용)`;
-    $('bar').style.width = (n / todo.length * 100) + '%';
+  // 한글 OCR 엔진 여러 개로 여러 페이지를 동시에 읽음 (결과는 페이지마다 따로 저장하므로 순서와 상관없음)
+  await mapLimit(todo, KOR_POOL + 1, async ([f, p, i]) => {
     try {
-      const page = await f.pdf.getPage(i + 1);
-      const h = await readHeader(page);
+      const h = await headerOf(f, i);
       p.sub = { ...classifyHeader(h, p.logo), hangul: h.hangul };
       p.headThumb = h.thumb;
       // 그냥 'INVOICE' 인 페이지는 본문에 한글이 있으면(포워더 청구서 등) 앞으로 옮기지 않음
-      if (p.sub.checkBody && await bodyHangulWords(page) >= 3) p.sub = { ...p.sub, act: 'keep', title: 'INVOICE (한글 포함)' };
+      if (p.sub.checkBody && await bodyHangulWords(await f.pdf.getPage(i + 1)) >= 3) p.sub = { ...p.sub, act: 'keep', title: 'INVOICE (한글 포함)' };
     } catch (err) {
       p.sub = { act: 'keep', title: '', hangul: 0 };
       log(`  ⚠️ ${i + 1}페이지 서류 종류 읽기 오류: ${err.message}`);
     }
-  }
+    $('status').textContent = `서류 종류 읽는 중 ${++n}/${todo.length}페이지 (사후제출용)`;
+    $('bar').style.width = (n / todo.length * 100) + '%';
+  });
   // 제목 없이 이어지는 한글 서식(예: 가격신고서 둘째 장)은 바로 앞 신고서류와 함께 뺌
   for (const f of files) {
     f.pages.forEach((p, i) => {
@@ -1205,12 +1229,24 @@ async function classifyAll() {
 
 const purposes = () => settings.purpose === 'both' ? ['keep', 'sub'] : [settings.purpose];
 
-function makeThumb(canvas) {
+// 작은 그림은 toBlob으로 만들어 압축을 화면 작업과 따로 처리 (toDataURL은 화면을 붙잡아 페이지당 0.15초 걸렸음)
+async function makeThumb(canvas) {
   const t = document.createElement('canvas');
   const scale = Math.min(1, 420 / canvas.width);
   t.width = canvas.width * scale; t.height = canvas.height * scale;
   t.getContext('2d').drawImage(canvas, 0, 0, t.width, t.height);
-  return t.toDataURL('image/jpeg', 0.7);
+  const blob = await new Promise(r => t.toBlob(r, 'image/jpeg', 0.7));
+  return blob ? URL.createObjectURL(blob) : t.toDataURL('image/jpeg', 0.7);
+}
+
+// items를 최대 limit개씩 동시에 처리 (fn 안에서 오류를 직접 처리해야 함)
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (next < items.length) { const k = next++; out[k] = await fn(items[k], k); }
+  }));
+  return out;
 }
 
 // ───────── 실행 ─────────
@@ -1253,30 +1289,42 @@ async function run() {
 
   // B/L 기준: 모든 페이지의 윗부분을 Claude가 확인해 B/L 첫 장을 찾고 엑셀과 맞춤.
   // 손글씨 번호는 빨간색만이 아니라 검은색·파란색도 있어서 색으로 걸러내지 않음 (빨간 글씨는 나누는 위치의 보조 신호로만 씀)
+  // 속도: 페이지 준비(그림·빨간 글씨) · Claude 확인 · 사후제출용 서류 종류 읽기(한글 OCR)를 동시에 진행.
+  // 각 페이지 결과는 따로 모았다가 끝난 뒤 페이지 순서대로 적용하므로 결과는 하나씩 할 때와 같음
   async function runBlFile(f, n) {
-    for (let i = 1; i <= n && !stopFlag; i++) {
-      $('status').textContent = `${f.name} · 페이지 준비 중 ${i}/${n}`;
-      const p = { no: '', src: '', thumb: '', logo: false, start: false, needOcr: false, redInk: 0 };
-      try {
-        const page = await f.pdf.getPage(i);
-        const top = await renderTop(page, 700 * 72 / page.getViewport({ scale: 1 }).width, 0.45);
-        p.thumb = makeThumb(top);
-        p.redInk = redInk(top);
-      } catch (err) {
-        log(`  ⚠️ ${i}페이지 오류: ${err.message}`);
-      }
-      f.pages.push(p);
-      tick();
-    }
-    if (stopFlag) return;
-    const marked = i => f.pages[i].redInk >= RED_INK_MIN;
-    const reds = f.pages.map((p, i) => i).filter(marked);
-    if (reds.length) log(`  🖍 빨간 손글씨가 있는 페이지: ${reds.map(i => i + 1).join(', ')}`);
     log(`  🤖 Claude가 ${n}페이지 윗부분을 모두 확인합니다`);
+    let prepped = 0, finished = 0;
+    const showStatus = () => {
+      $('status').textContent = `${f.name} · 페이지 준비 ${prepped}/${n} · Claude가 B/L 확인 중 ${finished}/${n}페이지`;
+    };
+    const ready = [], readyDone = [];
+    for (let i = 0; i < n; i++) ready.push(new Promise(r => { readyDone[i] = r; }));
+    const prep = (async () => {
+      for (let i = 1; i <= n && !stopFlag; i++) {
+        const p = { no: '', src: '', thumb: '', logo: false, start: false, needOcr: false, redInk: 0 };
+        try {
+          const page = await f.pdf.getPage(i);
+          const top = await renderTop(page, 700 * 72 / page.getViewport({ scale: 1 }).width, 0.45);
+          p.redInk = redInk(top);
+          p.thumb = await makeThumb(top);
+        } catch (err) {
+          log(`  ⚠️ ${i}페이지 오류: ${err.message}`);
+        }
+        f.pages.push(p);
+        readyDone[i - 1]();
+        prepped++; showStatus();
+        tick();
+      }
+      readyDone.forEach(r => r());   // 중지했으면 기다리는 쪽을 풀어줌
+    })();
+    // 사후제출용 서류 종류(페이지 위쪽 한글 OCR)는 Claude 결과와 상관없으므로 미리 읽어 둠
+    const heads = settings.purpose === 'keep' ? null
+      : mapLimit([...Array(n).keys()], KOR_POOL, async i => { await ready[i]; if (!stopFlag) await headerOf(f, i).catch(() => {}); });
+    const marked = i => f.pages[i].redInk >= RED_INK_MIN;
 
     // 한 번에 3페이지씩 동시에 물어봄 (결과 기록은 페이지 순서대로)
     const results = new Array(n);
-    let next = 0, finished = 0;
+    let next = 0;
     async function readOne(i) {
       const page = await f.pdf.getPage(i + 1);
       let r = await claudeReadBl(page);
@@ -1291,18 +1339,24 @@ async function run() {
       while (!stopFlag && !claudeOff) {
         const i = next++;
         if (i >= n) return;
+        await ready[i];
+        if (stopFlag || !f.pages[i]) return;
         try { results[i] = { r: await readOne(i) }; }
         catch (err) {
           const e = claudeError(err);
           results[i] = { err: e.text };
           if (e.fatal && !claudeOff) claudeOff = e.text;
         }
-        $('status').textContent = `${f.name} · Claude가 B/L 확인 중 ${++finished}/${n}페이지`;
+        finished++; showStatus();
         tick();
       }
     }
-    await Promise.all([worker(), worker(), worker()]);
+    await Promise.all([prep, worker(), worker(), worker()]);
     for (let i = n - finished; i > 0; i--) tick();
+    if (stopFlag) return;
+    const reds = f.pages.map((p, i) => i).filter(marked);
+    if (reds.length) log(`  🖍 빨간 손글씨가 있는 페이지: ${reds.map(i => i + 1).join(', ')}`);
+    if (heads) { $('status').textContent = `${f.name} · 서류 종류 읽기 마무리 중 (사후제출용)`; await heads; }
 
     for (let i = 0; i < n; i++) {
       const p = f.pages[i], res = results[i];
@@ -1345,7 +1399,7 @@ async function run() {
         const page = await f.pdf.getPage(i);
         const pageW = 700;
         const small = await renderRoi(page, pageW * 72 / page.getViewport({ scale: 1 }).width);
-        p.thumb = makeThumb(small);
+        p.thumb = await makeThumb(small);
         if (settings.useLogo) p.logo = logoScore(small, pageW) >= LOGO_THRESHOLD;
         const t = await readTextLayer(page);
         if (t.hasText && !settings.forceOcr) {
