@@ -62,10 +62,10 @@
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: bold; }
   button:disabled { opacity: .5; cursor: not-allowed; }
   /* 분석 버튼: 시작 녹색 · 중지 빨간색 · 완료 파란색 (다크 모드에서도 흰 글씨가 잘 보이는 진한 색) */
-  #runBtn.go { background: #1a7f37; border-color: #1a7f37; color: #fff; font-weight: bold; }
-  #runBtn.done { background: #1f6feb; border-color: #1f6feb; color: #fff; font-weight: bold; }
+  #runBtn { background: #1a7f37; border-color: #1a7f37; color: #fff; font-weight: bold; }
+  .done-badge { background: #1f6feb; color: #fff; font-weight: bold; border-radius: 6px; padding: 8px 14px; }
   #stopBtn:not(:disabled) { background: #c62828; border-color: #c62828; color: #fff; font-weight: bold; }
-  #status b { color: var(--text); }
+  .done-badge .usage { font-weight: normal; opacity: .9; }
   .progress { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 10px 0; }
   .progress > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
   .log { max-height: 160px; overflow: auto; font-family: Consolas, monospace; font-size: 12px;
@@ -202,8 +202,9 @@
   <section class="panel">
     <h2>3. 분석</h2>
     <div class="row">
-      <button class="go" id="runBtn" disabled>▶ 분류 시작</button>
+      <button id="runBtn" disabled>▶ 분류 시작</button>
       <button id="stopBtn" disabled>중지</button>
+      <span class="done-badge hidden" id="doneBadge"></span>
       <span class="muted" id="status"></span>
     </div>
     <p class="muted">처리하는 동안에는 이 탭을 화면에 띄워 두세요. 다른 탭으로 가거나 창을 내리면 브라우저가 작업을 멈춥니다.</p>
@@ -273,20 +274,16 @@ function saveSettings(keepDone) {
   if (!keepDone) setRunState('ready');
 }
 
-// 분석 버튼 상태: ready(녹색 '분류 시작') · running(중지 빨간색) · done(파란색 '완료' + 소요시간·비용)
-let runState = 'ready', runSummary = '';
+// 분석 상태: ready · running(중지 빨간색) · done(중지 옆에 파란 '완료' 표시 + 소요시간·비용)
+// '분류 시작' 버튼은 늘 녹색 그대로 두고, 완료는 따로 표시함 (버튼 글자가 바뀌면 헷갈림)
+let runState = 'ready';
 function setRunState(state, summaryHtml) {
   if (state === 'ready' && runState === 'running') return;   // 실행 중에는 바꾸지 않음
   runState = state;
-  const btn = $('runBtn');
-  if (!btn) return;
-  btn.classList.toggle('go', state !== 'done');
-  btn.classList.toggle('done', state === 'done');
-  btn.textContent = state === 'done' ? '✅ 완료' : '▶ 분류 시작';
-  btn.title = state === 'done' ? '누르면 처음부터 다시 분류합니다' : '';
-  if (state === 'done') { runSummary = summaryHtml || ''; $('status').innerHTML = runSummary; }
-  else if (state === 'ready' && $('status').dataset.done) $('status').textContent = '';
-  $('status').dataset.done = state === 'done' ? '1' : '';
+  const badge = $('doneBadge');
+  if (!badge) return;
+  if (state === 'done') { badge.innerHTML = summaryHtml || '✅ 완료'; $('status').textContent = ''; }
+  badge.classList.toggle('hidden', state !== 'done');
 }
 function bindSettings() {
   $('prefix').value = settings.prefix;
@@ -353,9 +350,9 @@ const KRW_PER_USD = 1400;
 const KEY_STORE = 'shingoSplitClaudeKey';
 const ENGINE_DESC = {
   free: '<b>무료</b> — 이 PC 안에서 Tesseract OCR로 읽습니다. 비용이 없고 외부로 아무것도 보내지 않습니다.',
-  auto: '<b>자동</b> — 무료 OCR로 먼저 읽고, 신고서 첫 장(UNI-PASS 로고 페이지)만 Claude가 한 번 더 읽어 확인합니다. '
+  auto: '<b>자동</b> — 무료 OCR로 먼저 읽고, 첫 장만 Claude가 한 번 더 읽어 확인합니다. '
     + '두 결과가 다르면 Claude 결과를 쓰고 노란색으로 표시하니 그림을 보고 확인하세요. '
-    + '신고서 첫 장의 번호 영역 이미지만 Anthropic으로 보냅니다 (신고서 1건당 약 0.2원, Haiku 기준).',
+    + '첫 장의 번호 영역 이미지만 Anthropic으로 보냅니다 (1건당 약 0.2원, Haiku 기준).',
   claude: '<b>Claude</b> — 번호를 읽어야 하는 페이지를 모두 Claude가 읽습니다. 가장 정확하지만 페이지마다 번호 영역 이미지를 '
     + 'Anthropic으로 보내고 API 비용이 듭니다. (Claude가 실패한 페이지는 무료 OCR로 다시 읽습니다)',
 };
@@ -1248,9 +1245,8 @@ async function classifyAll() {
       }
     });
   }
-  // 완료 뒤 저장 용도만 바꿔 다시 읽은 경우에는 소요시간·비용 표시를 되살림
-  if (runState === 'done') $('status').innerHTML = runSummary;
-  else $('status').textContent = '서류 종류 읽기 완료';
+  // 완료 뒤 저장 용도만 바꿔 다시 읽은 경우에는 완료 표시가 그대로 있으므로 상태 글자는 지움
+  $('status').textContent = runState === 'done' ? '' : '서류 종류 읽기 완료';
   $('runBtn').disabled = false;
   classifying = false; renderFileChips();
 }
@@ -1520,9 +1516,9 @@ async function run() {
   else {
     const won = claudeUsage.usd * KRW_PER_USD;
     const cost = !claudeUsage.pages ? '0원' : `약 ${won < 1 ? won.toFixed(2) : Math.round(won).toLocaleString()}원`;
-    setRunState('done', `<b>⏱ ${sec}초 · 💰 ${cost}</b>`
-      + (claudeUsage.pages ? ` (Claude ${claudeUsage.pages}페이지)` : '')
-      + (claudeOff ? ' · ⚠️ Claude 사용 불가 (기록 참고)' : ''));
+    setRunState('done', `✅ 완료 · ${sec}초 · ${cost}`
+      + (claudeUsage.pages ? ` <span class="usage">(Claude ${claudeUsage.pages}페이지)</span>` : '')
+      + (claudeOff ? ' <span class="usage">· ⚠️ Claude 사용 불가 (기록 참고)</span>' : ''));
   }
   renderFileChips();
   renderResults();
