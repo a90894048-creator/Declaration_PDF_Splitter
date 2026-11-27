@@ -3,11 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 보안: 스크립트를 받을 곳과 데이터를 보낼 곳을 아래 목록으로만 제한 (API 키가 다른 서버로 새지 않게) -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://cdn.sheetjs.com; worker-src 'self' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; connect-src 'self' blob: data: https://api.anthropic.com https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://tessdata.projectnaptha.com; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
 <title>신고번호 PDF 분할기</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<!-- integrity: CDN의 파일이 바뀌면 브라우저가 실행하지 않음 -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js" integrity="sha384-/1qUCSGwTur9vjf/z9lmu/eCUYbpOTgSjmpbMQZ1/CtX2v/WcAIKqRv+U1DUCG6e" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js" integrity="sha384-weMABwrltA6jWR8DDe9Jp5blk+tZQh7ugpCsF3JwSA53WZM9/14PjS5LAJNHNjAI" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" integrity="sha384-+mbV2IY1Zk/X1p/nWllGySJSUN8uMs+gUAN10Or95UBH0fpj6GfKgPmgC5EXieXG" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js" integrity="sha384-GJqSu7vueQ9qN0E9yLPb3Wtpd7OrgK8KmYzC8T1IysG1bcvxvIO4qtYR/D3A991F" crossorigin="anonymous"></script>
 <style>
   :root {
     --bg: #f4f6f9; --panel: #ffffff; --text: #1d2330; --muted: #667085; --line: #dfe3ea;
@@ -393,7 +396,7 @@ async function addFiles(list) {
     if (files.some(x => x.name === f.name && x.size === f.size)) continue;
     const buf = await f.arrayBuffer();
     try {
-      const pdf = await pdfjsLib.getDocument({ data: buf.slice(0) }).promise;
+      const pdf = await pdfjsLib.getDocument({ data: buf.slice(0), isEvalSupported: false }).promise;
       files.push({ name: f.name, size: f.size, buf, pdf, pages: [] });
       log(`✅ ${f.name} (${pdf.numPages}페이지)`);
     } catch (err) {
@@ -408,12 +411,15 @@ async function addFiles(list) {
 // ───────── 엑셀 (B/L번호 → 신고번호) ─────────
 // 엑셀은 이 PC 브라우저 안에서만 읽음. 헤더 한글이 깨져 저장된 파일도 있어 열 위치(S, BJ)를 기본으로 쓰고,
 // 맞지 않으면 'B/L'이 들어간 헤더와 신고번호 모양(4363226203676M)이 가장 많은 열을 찾아 씀
-const XLSX_URL = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+// cdnjs의 0.18.5는 취약점(CVE-2023-30533 등)이 있어 SheetJS 공식 CDN의 고친 버전을 씀
+const XLSX_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
+const XLSX_SRI = 'sha384-EnyY0/GSHQGSxSgMwaIPzSESbqoOLSexfnSMN2AP+39Ckmn92stwABZynq1JyzdT';
 let excelRows = [];   // [{ bl, key, no }]  no: 43632-26-203676M
 let excelName = '';
-function loadScript(url) {
+function loadScript(url, integrity) {
   return new Promise((ok, fail) => {
     const s = document.createElement('script');
+    if (integrity) { s.integrity = integrity; s.crossOrigin = 'anonymous'; }
     s.src = url; s.onload = ok; s.onerror = () => fail(new Error('엑셀 읽기 도구를 불러오지 못했습니다 (인터넷 연결 확인)'));
     document.head.appendChild(s);
   });
@@ -426,7 +432,7 @@ const blRaw = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 
 async function loadExcel(file) {
   try {
-    if (!window.XLSX) await loadScript(XLSX_URL);
+    if (!window.XLSX) await loadScript(XLSX_URL, XLSX_SRI);
     const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
     let best = null;
     for (const name of wb.SheetNames) {
@@ -729,43 +735,76 @@ async function ocrPage(page) {
 }
 
 // ───────── Claude OCR ─────────
-// 공식 Anthropic SDK를 Claude를 처음 쓸 때만 불러옴 (무료 모드에서는 받지 않음)
-const CLAUDE_SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@1.6.0/+esm';
+// 외부 SDK를 받지 않고 Anthropic API를 직접 호출 (CDN에서 받은 코드가 API 키를 만지지 않도록)
+const CLAUDE_API = 'https://api.anthropic.com/v1';
+class ClaudeApiError extends Error {
+  constructor(status, body, message) {
+    super(message || body?.error?.message || `HTTP ${status}`);
+    this.status = status;   // 0 = 인터넷 연결 문제
+    this.error = body;      // { type: 'error', error: { type, message } }
+  }
+}
+// SDK와 같은 기준으로 다시 시도: 연결 실패·408·409·429·5xx, 최대 2번
+async function claudeFetch(key, path, { method = 'GET', body, beta } = {}) {
+  const headers = {
+    'x-api-key': key,
+    'anthropic-version': '2023-06-01',
+    'anthropic-dangerous-direct-browser-access': 'true',
+  };
+  if (body) headers['content-type'] = 'application/json';
+  if (beta) headers['anthropic-beta'] = beta.join(',');
+  for (let attempt = 0; ; attempt++) {
+    let res;
+    try {
+      res = await fetch(CLAUDE_API + path, { method, headers, body: body && JSON.stringify(body) });
+    } catch (err) {
+      if (attempt < 2) { await new Promise(r => setTimeout(r, 500 * 2 ** attempt)); continue; }
+      throw new ClaudeApiError(0, null, err.message);
+    }
+    const data = await res.json().catch(() => null);
+    if (res.ok) return data;
+    const retry = res.status === 408 || res.status === 409 || res.status === 429 || res.status >= 500;
+    if (retry && attempt < 2) {
+      const wait = Math.min(+res.headers.get('retry-after') * 1000 || 500 * 2 ** attempt, 60000);
+      await new Promise(r => setTimeout(r, wait));
+      continue;
+    }
+    throw new ClaudeApiError(res.status, data);
+  }
+}
 const CLAUDE_PROMPT = '이 이미지는 한국 수입·수출신고서(또는 신고필증) 첫 장의 좌측 상단입니다. '
   + "'신고번호' 칸에 인쇄된 신고번호를 읽어 주세요. 형식은 5자리-2자리-6자리 뒤에 영문 1자입니다 (예: 43632-26-303166M). "
   + 'File No, B/L 번호, 화물관리번호 같은 다른 번호는 무시하세요. 숫자를 한 자리씩 정확히 읽고, '
   + '답은 신고번호만 한 줄로 쓰세요. 신고번호가 보이지 않으면 NONE 이라고만 쓰세요.';
-let claudeSdk = null, claudeClient = null, claudeClientKey = '';
 let claudeOff = '';   // 이번 실행에서 Claude를 더 쓰지 않기로 한 이유 (키 오류·한도 초과 등)
 const claudeUsage = { pages: 0, inTok: 0, outTok: 0, usd: 0 };
 
 async function getClaude() {
   const key = getClaudeKey();
   if (!key) throw new Error('API 키가 없습니다');
-  if (!claudeSdk) claudeSdk = await import(CLAUDE_SDK_URL);
-  if (!claudeClient || claudeClientKey !== key) {
-    const Anthropic = claudeSdk.default;
-    // 키는 각 사용자 PC 브라우저에만 저장됨. 공개 코드에는 키가 없음
-    claudeClient = new Anthropic({ apiKey: key, dangerouslyAllowBrowser: true, maxRetries: 2 });
-    claudeClientKey = key;
-  }
-  return claudeClient;
+  // 키는 각 사용자 PC 브라우저에만 저장됨. 공개 코드에는 키가 없음
+  const create = beta => params => claudeFetch(key, '/messages', { method: 'POST', body: params, beta });
+  return {
+    messages: { create: create(null) },
+    beta: { messages: { create: ({ betas, ...params }) => create(betas)(params) } },
+    models: { retrieve: id => claudeFetch(key, '/models/' + encodeURIComponent(id)) },
+  };
 }
 
 // fatal: 이번 실행 동안 Claude를 끄고 무료 OCR로만 처리해야 하는 오류
 function claudeError(err) {
-  const A = claudeSdk && claudeSdk.default;
   const msg = (err && (err.error?.error?.message || err.message)) || String(err);
-  if (A && err instanceof A.AuthenticationError) return { fatal: true, text: 'API 키가 올바르지 않거나 만료·삭제되었습니다.' };
-  if (A && err instanceof A.PermissionDeniedError) return { fatal: true, text: '이 API 키로는 사용할 수 없습니다 (권한 없음).' };
-  if (A && err instanceof A.NotFoundError) return { fatal: true, text: '선택한 모델을 찾을 수 없습니다. 다른 모델을 골라 주세요.' };
+  const type = err?.error?.error?.type;
+  const api = err instanceof ClaudeApiError;
+  if (api && err.status === 401) return { fatal: true, text: 'API 키가 올바르지 않거나 만료·삭제되었습니다.' };
   if (/usage limits/i.test(msg) || err?.error?.error?.error_code === 'enforced_spend_limit_reached')
     return { fatal: true, text: '이번 달 API 사용 한도에 도달했습니다. 다음 달 1일에 다시 쓸 수 있습니다.' };
-  if (err?.type === 'billing_error' || /credit balance/i.test(msg))
+  if (type === 'billing_error' || /credit balance/i.test(msg))
     return { fatal: true, text: 'API 크레딧 잔액이 부족합니다.' };
-  if (A && err instanceof A.RateLimitError) return { fatal: false, text: '요청이 너무 많아 잠시 거절되었습니다.' };
-  if (A && err instanceof A.APIConnectionError) return { fatal: false, text: '인터넷 연결 문제로 Claude에 접속하지 못했습니다.' };
-  if (!claudeSdk) return { fatal: true, text: `Claude 연결 도구를 불러오지 못했습니다 (${msg})` };
+  if (api && err.status === 403) return { fatal: true, text: '이 API 키로는 사용할 수 없습니다 (권한 없음).' };
+  if (api && err.status === 404) return { fatal: true, text: '선택한 모델을 찾을 수 없습니다. 다른 모델을 골라 주세요.' };
+  if (api && err.status === 429) return { fatal: false, text: '요청이 너무 많아 잠시 거절되었습니다.' };
+  if (api && err.status === 0) return { fatal: false, text: '인터넷 연결 문제로 Claude에 접속하지 못했습니다.' };
   return { fatal: false, text: msg };
 }
 
