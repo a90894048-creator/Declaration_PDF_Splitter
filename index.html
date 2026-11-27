@@ -114,8 +114,6 @@
     <input type="file" id="fileInput" accept="application/pdf,.xls,.xlsx" multiple class="hidden">
     <div class="files" id="fileChips"></div>
     <div class="row" id="excelRow" style="margin-top:10px">
-      <button id="excelBtn">📊 엑셀 선택 (B/L번호 → 신고번호)</button>
-      <input type="file" id="excelInput" accept=".xls,.xlsx" class="hidden">
       <span class="muted" id="excelInfo"></span>
     </div>
   </section>
@@ -601,8 +599,6 @@ function editDist1(a, b) {
   }
   return diff + (a.length - i) + (b.length - j) <= 1;
 }
-$('excelBtn').addEventListener('click', () => $('excelInput').click());
-$('excelInput').addEventListener('change', async e => { if (e.target.files[0]) await loadExcel(e.target.files[0]); e.target.value = ''; });
 
 async function renderPreview() {
   const page = await files[0].pdf.getPage(1);
