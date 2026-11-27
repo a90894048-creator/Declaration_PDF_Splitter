@@ -1012,8 +1012,32 @@ async function readHeader(page) {
   const words = (data.blocks || []).flatMap(b => b.paragraphs.flatMap(p => p.lines.flatMap(l => l.words)));
   // 영문 서류에서 한글이 잘못 섞여 나오는 것을 막으려고 확실히 읽힌 글자만 셈
   const hangul = words.filter(w => w.confidence >= 70).reduce((n, w) => n + (w.text.match(/[가-힣]/g) || []).length, 0);
-  const lines = (data.blocks || []).flatMap(b => b.paragraphs.flatMap(p => p.lines)).map(l => l.text.toUpperCase().replace(/[^A-Z]/g, ''));
+  const lines = (data.blocks || []).flatMap(b => b.paragraphs.flatMap(p => p.lines)).map(l => fixCommercial(l.text.toUpperCase().replace(/[^A-Z]/g, '')));
   return { text: data.text.replace(/\s/g, ''), hangul, lines, thumb: makeThumb(c) };
+}
+
+// 두 낱말이 몇 글자 다른지 (글자 바꿈·빠짐·더함 횟수)
+function editDistance(a, b) {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+// 타자기 글꼴 제목은 OCR이 COMMERCIAL 의 I 를 T 로 읽는 등 한두 글자 틀리게 읽음 (실측: 'COMMERCTAL INVOICE')
+// INVOICE 바로 앞 낱말이 COMMERCIAL 과 2글자 이내로 다르면 COMMERCIAL 로 바로잡음
+function fixCommercial(line) {
+  const k = line.indexOf('INVOICE');
+  for (const n of [10, 9, 11]) {
+    if (k < n) continue;
+    const w = line.slice(k - n, k);
+    if (w === 'COMMERCIAL') return line;
+    if (editDistance(w, 'COMMERCIAL') <= 2) return line.slice(0, k - n) + 'COMMERCIAL' + line.slice(k);
+  }
+  return line;
 }
 
 // 페이지 전체에서 확실히 읽힌 한글 낱말(2글자 이상) 수. 실측: 포워더 청구서 6~10개, 영문 인보이스 0개
