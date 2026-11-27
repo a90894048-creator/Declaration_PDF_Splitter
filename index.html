@@ -37,7 +37,13 @@
     color: var(--muted); cursor: pointer; transition: .15s; }
   .drop.over, .drop:hover { border-color: var(--accent); background: var(--accent-weak); color: var(--text); }
   .files { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
-  .chip { background: var(--accent-weak); border-radius: 999px; padding: 3px 10px; font-size: 12px; }
+  .chip { background: var(--accent-weak); border-radius: 999px; padding: 3px 10px; font-size: 12px;
+    display: inline-flex; align-items: center; gap: 6px; }
+  .chip.excel { background: rgba(52, 168, 83, .18); }
+  .chip-x { border: 0; background: transparent; color: var(--muted); padding: 0 2px; margin: 0; font-size: 14px;
+    line-height: 1; cursor: pointer; min-width: 0; border-radius: 50%; }
+  .chip-x:hover { color: var(--warn); background: transparent; }
+  .chip-x:disabled { opacity: .35; cursor: not-allowed; }
   .settings { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 800px) { .settings { grid-template-columns: 1fr; } }
   .field { display: grid; gap: 4px; margin-bottom: 10px; }
@@ -103,14 +109,14 @@
 </header>
 <main>
   <section class="panel">
-    <h2>1. PDF 파일 선택</h2>
-    <div class="drop" id="drop">여기에 PDF를 끌어놓거나 클릭해서 선택하세요 (여러 개 가능 · B/L 기준이면 엑셀도 함께 끌어놓으세요)</div>
+    <h2>1. 파일 선택</h2>
+    <div class="drop" id="drop">PDF와 엑셀을 함께 끌어놓거나 클릭해서 선택하세요 (여러 개 가능 · 엑셀은 B/L 기준이면 꼭 필요하고, 신고서 기준이면 선택)</div>
     <input type="file" id="fileInput" accept="application/pdf,.xls,.xlsx" multiple class="hidden">
     <div class="files" id="fileChips"></div>
     <div class="row" id="excelRow" style="margin-top:10px">
       <button id="excelBtn">📊 엑셀 선택 (B/L번호 → 신고번호)</button>
       <input type="file" id="excelInput" accept=".xls,.xlsx" class="hidden">
-      <span class="muted" id="excelInfo">'B/L + 엑셀' 기준에서는 꼭 필요하고, 신고서 기준에서는 선택입니다. 넣으면 J열 첨부서류가 '사후'이거나, J열에 글씨가 있으면서 U열(CS)이 빈칸인 건만 사후제출용을 만듭니다.</span>
+      <span class="muted" id="excelInfo"></span>
     </div>
   </section>
 
@@ -403,9 +409,63 @@ async function addFiles(list) {
       log(`❌ ${f.name} 열기 실패: ${err.message}`);
     }
   }
-  $('fileChips').innerHTML = files.map(f => `<span class="chip">${esc(f.name)} · ${f.pdf.numPages}p</span>`).join('');
+  renderFileChips();
   updateRunBtn();
   if (files.length) renderPreview();
+}
+
+// ───────── 파일 칩 · X로 지우기 ─────────
+// 읽는 중(실행·서류 종류 읽기)에는 지우면 처리 중인 목록이 바뀌므로 X를 막음
+let classifying = false;
+const isBusy = () => !$('stopBtn').disabled || classifying;
+function renderFileChips() {
+  const dis = isBusy() ? ' disabled' : '';
+  $('fileChips').innerHTML = files.map((f, i) => `<span class="chip">${esc(f.name)} · ${f.pdf.numPages}p`
+    + `<button class="chip-x" data-remove="${i}" title="이 파일 빼기" aria-label="${esc(f.name)} 빼기"${dis}>✕</button></span>`).join('');
+  renderExcelInfo();
+}
+function renderExcelInfo(msg) {
+  const el = $('excelInfo');
+  if (msg) { el.textContent = msg; return; }
+  if (!excelRows.length) {
+    el.textContent = "'B/L + 엑셀' 기준에서는 꼭 필요하고, 신고서 기준에서는 선택입니다. 넣으면 J열 첨부서류가 '사후'이거나, J열에 글씨가 있으면서 U열(CS)이 빈칸인 건만 사후제출용을 만듭니다.";
+    return;
+  }
+  el.innerHTML = `<span class="chip excel">✅ ${esc(excelName)}`
+    + `<button class="chip-x" id="excelRemove" title="엑셀 빼기" aria-label="엑셀 빼기"${isBusy() ? ' disabled' : ''}>✕</button></span> ${esc(excelSummary)}`;
+}
+$('fileChips').addEventListener('click', e => {
+  const b = e.target.closest('[data-remove]');
+  if (b && !isBusy()) removeFile(+b.dataset.remove);
+});
+$('excelInfo').addEventListener('click', e => {
+  if (e.target.closest('#excelRemove') && !isBusy()) removeExcel();
+});
+function removeFile(i) {
+  const [f] = files.splice(i, 1);
+  if (!f) return;
+  f.pdf.destroy?.();
+  log(`🗑 ${f.name} 뺐습니다`);
+  if (zoomAt) closeZoom();
+  renderFileChips();
+  updateRunBtn();
+  if (files.length) renderPreview();
+  else {
+    $('previewWrap').classList.add('hidden');
+    $('previewEmpty').classList.remove('hidden');
+  }
+  if (files.some(x => x.pages.length)) renderResults();
+  else {
+    $('resultPanel').classList.add('hidden');
+    $('pageArea').innerHTML = ''; $('segBody').innerHTML = '';
+  }
+}
+function removeExcel() {
+  log(`🗑 엑셀 ${excelName} 뺐습니다`);
+  excelRows = []; excelName = ''; excelSummary = ''; excelByNo = new Map();
+  renderExcelInfo();
+  renderSplitMode();
+  if (files.some(f => f.pages.length)) renderResults();
 }
 
 // ───────── 엑셀 (B/L번호 → 신고번호) ─────────
@@ -415,7 +475,7 @@ async function addFiles(list) {
 const XLSX_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
 const XLSX_SRI = 'sha384-EnyY0/GSHQGSxSgMwaIPzSESbqoOLSexfnSMN2AP+39Ckmn92stwABZynq1JyzdT';
 let excelRows = [];   // [{ bl, key, no }]  no: 43632-26-203676M
-let excelName = '';
+let excelName = '', excelSummary = '';
 function loadScript(url, integrity) {
   return new Promise((ok, fail) => {
     const s = document.createElement('script');
@@ -446,12 +506,13 @@ async function loadExcel(file) {
     const colName = i => XLSX.utils.encode_col(i);
     const posts = best.rows.filter(r => r.post).length;
     const info = `${best.rows.length}건 (B/L ${colName(best.blCol)}열 → 신고번호 ${colName(best.noCol)}열) · 사후제출 대상 ${posts}건 (${colName(best.attCol)}열 '사후' 또는 ${colName(best.attCol)}열 글씨+${colName(best.csCol)}열 빈칸)`;
-    $('excelInfo').textContent = `✅ ${file.name} · ${info}`;
+    excelSummary = info;
+    renderExcelInfo();
     log(`📊 엑셀 ${file.name}: ${info}`);
     if (files.some(f => f.pages.length)) renderResults();
   } catch (err) {
-    excelRows = []; excelName = ''; excelByNo = new Map();
-    $('excelInfo').textContent = `❌ ${file.name}: ${err.message}`;
+    excelRows = []; excelName = ''; excelSummary = ''; excelByNo = new Map();
+    renderExcelInfo(`❌ ${file.name}: ${err.message}`);
     log(`❌ 엑셀 ${file.name} 읽기 실패: ${err.message}`);
   }
   renderSplitMode();
@@ -1115,6 +1176,7 @@ async function classifyAll() {
   const todo = files.flatMap(f => f.pages.map((p, i) => [f, p, i])).filter(([, p]) => !p.sub);
   if (!todo.length) return;
   $('runBtn').disabled = true;
+  classifying = true; renderFileChips();
   let n = 0;
   for (const [f, p, i] of todo) {
     $('status').textContent = `서류 종류 읽는 중 ${++n}/${todo.length}페이지 (사후제출용)`;
@@ -1142,6 +1204,7 @@ async function classifyAll() {
   }
   $('status').textContent = '서류 종류 읽기 완료';
   $('runBtn').disabled = false;
+  classifying = false; renderFileChips();
 }
 
 const purposes = () => settings.purpose === 'both' ? ['keep', 'sub'] : [settings.purpose];
@@ -1166,6 +1229,7 @@ document.addEventListener('visibilitychange', () => {
 async function run() {
   stopFlag = false;
   $('runBtn').disabled = true; $('stopBtn').disabled = false;
+  renderFileChips();
   // 진행률: 페이지당 1단계 1칸 + 2단계(OCR) 1칸, OCR 안 할 페이지가 정해지면 전체에서 뺌
   let total = files.reduce((a, f) => a + f.pdf.numPages * 2, 0);
   let done = 0;
@@ -1184,6 +1248,7 @@ async function run() {
     log(!excelRows.length ? '⚠️ B/L 기준으로 나누려면 엑셀 파일을 먼저 선택하세요.' : '⚠️ B/L 기준으로 나누려면 Claude API 키가 필요합니다 (2. 인식 설정).');
     $('status').textContent = '엑셀 또는 API 키가 필요합니다';
     $('runBtn').disabled = false; $('stopBtn').disabled = true;
+    renderFileChips();
     return;
   }
   if (blMode) log(`🧾 분할 기준: B/L + 엑셀 (${excelName}, ${excelRows.length}건) · ${CLAUDE_MODELS[settings.claudeModel].label}`);
@@ -1373,6 +1438,7 @@ async function run() {
   if (claudeOff) usageText += ' · ⚠️ Claude 사용 불가 (기록 참고)';
   $('status').textContent = stopFlag ? '중지됨' : `완료 (${sec}초)${usageText}`;
   $('runBtn').disabled = false; $('stopBtn').disabled = true;
+  renderFileChips();
   renderResults();
 }
 
@@ -1787,6 +1853,7 @@ function log(msg) { const el = $('log'); el.textContent += msg + '\n'; el.scroll
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
 bindSettings();
+renderExcelInfo();
 renderPurpose();
 </script>
 </body>
