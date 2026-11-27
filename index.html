@@ -61,6 +61,11 @@
     padding: 8px 14px; border-radius: 6px; cursor: pointer; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: bold; }
   button:disabled { opacity: .5; cursor: not-allowed; }
+  /* 분석 버튼: 시작 녹색 · 중지 빨간색 · 완료 파란색 (다크 모드에서도 흰 글씨가 잘 보이는 진한 색) */
+  #runBtn.go { background: #1a7f37; border-color: #1a7f37; color: #fff; font-weight: bold; }
+  #runBtn.done { background: #1f6feb; border-color: #1f6feb; color: #fff; font-weight: bold; }
+  #stopBtn:not(:disabled) { background: #c62828; border-color: #c62828; color: #fff; font-weight: bold; }
+  #status b { color: var(--text); }
   .progress { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 10px 0; }
   .progress > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
   .log { max-height: 160px; overflow: auto; font-family: Consolas, monospace; font-size: 12px;
@@ -197,7 +202,7 @@
   <section class="panel">
     <h2>3. 분석</h2>
     <div class="row">
-      <button class="primary" id="runBtn" disabled>🚀 신고번호 읽기</button>
+      <button class="go" id="runBtn" disabled>▶ 분류 시작</button>
       <button id="stopBtn" disabled>중지</button>
       <span class="muted" id="status"></span>
     </div>
@@ -262,8 +267,26 @@ function loadSettings() {
   try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem('shingoSplitSettings') || '{}') }; }
   catch { return { ...DEFAULTS }; }
 }
-function saveSettings() {
+// keepDone: 저장 용도만 바뀐 경우처럼 다시 읽을 필요가 없으면 '완료' 표시를 그대로 둠
+function saveSettings(keepDone) {
   try { localStorage.setItem('shingoSplitSettings', JSON.stringify(settings)); } catch {}
+  if (!keepDone) setRunState('ready');
+}
+
+// 분석 버튼 상태: ready(녹색 '분류 시작') · running(중지 빨간색) · done(파란색 '완료' + 소요시간·비용)
+let runState = 'ready', runSummary = '';
+function setRunState(state, summaryHtml) {
+  if (state === 'ready' && runState === 'running') return;   // 실행 중에는 바꾸지 않음
+  runState = state;
+  const btn = $('runBtn');
+  if (!btn) return;
+  btn.classList.toggle('go', state !== 'done');
+  btn.classList.toggle('done', state === 'done');
+  btn.textContent = state === 'done' ? '✅ 완료' : '▶ 분류 시작';
+  btn.title = state === 'done' ? '누르면 처음부터 다시 분류합니다' : '';
+  if (state === 'done') { runSummary = summaryHtml || ''; $('status').innerHTML = runSummary; }
+  else if (state === 'ready' && $('status').dataset.done) $('status').textContent = '';
+  $('status').dataset.done = state === 'done' ? '1' : '';
 }
 function bindSettings() {
   $('prefix').value = settings.prefix;
@@ -409,6 +432,7 @@ async function addFiles(list) {
   }
   renderFileChips();
   updateRunBtn();
+  setRunState('ready');   // 파일이 바뀌면 다시 분류해야 함
   if (files.length) renderPreview();
 }
 
@@ -447,6 +471,7 @@ function removeFile(i) {
   if (zoomAt) closeZoom();
   renderFileChips();
   updateRunBtn();
+  setRunState('ready');
   if (files.length) renderPreview();
   else {
     $('previewWrap').classList.add('hidden');
@@ -463,6 +488,7 @@ function removeExcel() {
   excelRows = []; excelName = ''; excelSummary = ''; excelByNo = new Map();
   renderExcelInfo();
   renderSplitMode();
+  setRunState('ready');
   if (files.some(f => f.pages.length)) renderResults();
 }
 
@@ -1222,7 +1248,9 @@ async function classifyAll() {
       }
     });
   }
-  $('status').textContent = '서류 종류 읽기 완료';
+  // 완료 뒤 저장 용도만 바꿔 다시 읽은 경우에는 소요시간·비용 표시를 되살림
+  if (runState === 'done') $('status').innerHTML = runSummary;
+  else $('status').textContent = '서류 종류 읽기 완료';
   $('runBtn').disabled = false;
   classifying = false; renderFileChips();
 }
@@ -1260,7 +1288,10 @@ document.addEventListener('visibilitychange', () => {
 
 async function run() {
   stopFlag = false;
+  setRunState('ready');   // 완료 표시를 지우고 녹색으로 되돌린 뒤 실행 중으로 바꿈
+  runState = 'running';
   $('runBtn').disabled = true; $('stopBtn').disabled = false;
+  $('status').textContent = '';
   renderFileChips();
   // 진행률: 페이지당 1단계 1칸 + 2단계(OCR) 1칸, OCR 안 할 페이지가 정해지면 전체에서 뺌
   let total = files.reduce((a, f) => a + f.pdf.numPages * 2, 0);
@@ -1278,6 +1309,7 @@ async function run() {
   const blMode = settings.splitMode === 'bl';
   if (blMode && (!excelRows.length || !getClaudeKey())) {
     log(!excelRows.length ? '⚠️ B/L 기준으로 나누려면 엑셀 파일을 먼저 선택하세요.' : '⚠️ B/L 기준으로 나누려면 Claude API 키가 필요합니다 (2. 인식 설정).');
+    runState = 'ready';
     $('status').textContent = '엑셀 또는 API 키가 필요합니다';
     $('runBtn').disabled = false; $('stopBtn').disabled = true;
     renderFileChips();
@@ -1476,18 +1508,22 @@ async function run() {
   }
   if (!stopFlag && settings.purpose !== 'keep') await classifyAll();
   const sec = ((performance.now() - t0) / 1000).toFixed(1);
-  let usageText = '';
   if (claudeUsage.pages) {
-    const won = claudeUsage.usd * KRW_PER_USD;
-    usageText = ` · Claude ${claudeUsage.pages}페이지 약 ${won < 1 ? won.toFixed(2) : Math.round(won).toLocaleString()}원`;
     log(`\n🤖 Claude 사용: ${claudeUsage.pages}페이지 · 입력 ${claudeUsage.inTok.toLocaleString()} / 출력 ${claudeUsage.outTok.toLocaleString()} 토큰`
       + ` · 약 $${claudeUsage.usd.toFixed(4)} (약 ${(claudeUsage.usd * KRW_PER_USD).toFixed(1)}원)`);
   } else if (engine !== 'free' && !stopFlag) {
     log(claudeOff ? `\n🤖 Claude를 쓰지 못했습니다: ${claudeOff} (비용 0원)` : '\n🤖 Claude에 보낸 페이지가 없습니다 (비용 0원)');
   }
-  if (claudeOff) usageText += ' · ⚠️ Claude 사용 불가 (기록 참고)';
-  $('status').textContent = stopFlag ? '중지됨' : `완료 (${sec}초)${usageText}`;
   $('runBtn').disabled = false; $('stopBtn').disabled = true;
+  runState = 'idle';
+  if (stopFlag) { setRunState('ready'); $('status').textContent = '중지됨'; }
+  else {
+    const won = claudeUsage.usd * KRW_PER_USD;
+    const cost = !claudeUsage.pages ? '0원' : `약 ${won < 1 ? won.toFixed(2) : Math.round(won).toLocaleString()}원`;
+    setRunState('done', `<b>⏱ ${sec}초 · 💰 ${cost}</b>`
+      + (claudeUsage.pages ? ` (Claude ${claudeUsage.pages}페이지)` : '')
+      + (claudeOff ? ' · ⚠️ Claude 사용 불가 (기록 참고)' : ''));
+  }
   renderFileChips();
   renderResults();
 }
@@ -1503,7 +1539,7 @@ function renderPurpose() {
 }
 $('purpose').querySelectorAll('button').forEach(b => b.addEventListener('click', async () => {
   settings.purpose = b.dataset.purpose;
-  saveSettings();
+  saveSettings(true);
   renderPurpose();
   if (settings.purpose !== 'keep' && files.some(f => f.pages.length)) await classifyAll();
   renderResults();
